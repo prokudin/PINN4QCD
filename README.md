@@ -8,4 +8,10 @@ This notebook covers the content of the presentation "A Study of Applications of
   <img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab"/>
 </a>
 
+We also implemented PINN for the electro-magnetic wave, see the notebook
+
+<a target="_blank" href="https://colab.research.google.com/github/prokudin/PINN4QCD/blob/main/em_wave/Maxwell_Eqns_Agustin.ipynb">
+  <img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab"/>
+</a>
+
 
