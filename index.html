@@ -1,0 +1,2177 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>PINN Research Platform</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js">
+/* ══════════════════════════════════════════════════════════════════
+   CUSTOM ACTIVATION BUILDER — full implementation
+══════════════════════════════════════════════════════════════════ */
+
+let _actValTimer=null, _actPrevChart=null, _actDerivChart=null;
+
+function insertTok(s){
+  const inp=document.getElementById('act-expr');
+  const a=inp.selectionStart,b=inp.selectionEnd;
+  inp.value=inp.value.slice(0,a)+s+inp.value.slice(b);
+  inp.selectionStart=inp.selectionEnd=a+s.length;
+  inp.focus(); debounceActVal();
+}
+
+function debounceActVal(){
+  updateTopBar();
+  clearTimeout(_actValTimer);
+  const sl=document.getElementById('act-status');
+  sl.textContent='Validating…'; sl.className='act-status wait';
+  _actValTimer=setTimeout(runActVal,500);
+}
+
+async function runActVal(){
+  const mode=S._actMode||'math';
+  const sl=document.getElementById('act-status');
+
+  // ── Live backend path ──────────────────────────────────────────
+  if(S.live&&S.backendOk){
+    let expr='';
+    if(mode==='math')  expr=document.getElementById('act-expr').value.trim();
+    if(mode==='para')  expr=document.getElementById('act-para-template').value.trim();
+    if(!expr){sl.textContent='Enter an expression';sl.className='act-status wait';return;}
+    try{
+      const url=getWS().replace(/^ws/,'http').replace('/ws','');
+      const r=await fetch(url+'/api/validate_act',{
+        method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({expr,mode}),signal:AbortSignal.timeout(5000)});
+      const d=await r.json();
+      if(d.ok){
+        sl.textContent=`✓ f(0)=${d.f0}  f(1)=${d.f1}  range [${d.min},${d.max}]`;
+        sl.className='act-status ok';
+        drawActPreview(d.x,d.y,d.dy);
+        showActMetrics(d);
+        // Run suitability in background
+        runSuitability(expr, url);
+      } else {
+        sl.textContent='✗ '+d.error; sl.className='act-status err';
+      }
+    }catch(e){sl.textContent='✗ '+e.message;sl.className='act-status err';}
+    return;
+  }
+
+  // ── Browser fallback (math mode only) ─────────────────────────
+  if(mode==='math'){
+    const expr=document.getElementById('act-expr').value.trim();
+    if(!expr){sl.textContent='Enter expression';sl.className='act-status wait';return;}
+    try{
+      const T={
+        sin:Math.sin,cos:Math.cos,tanh:Math.tanh,exp:Math.exp,log:Math.log,
+        sqrt:Math.sqrt,abs:Math.abs,relu:x=>Math.max(0,x),
+        sigmoid:x=>1/(1+Math.exp(-x)),
+        erf:x=>{const a=[.254829592,-.284496736,1.421413741,-1.453152027,1.061405429],p=.3275911;
+          const s=x<0?-1:1,t=1/(1+p*Math.abs(x));
+          return s*(1-(((((a[4]*t+a[3])*t+a[2])*t+a[1])*t+a[0])*t*Math.exp(-x*x)));},
+        softplus:x=>Math.log(1+Math.exp(x)),
+        nn:{functional:{softplus:x=>Math.log(1+Math.exp(x))}},
+      };
+      // Make torch object that wraps T
+      const torch={...T,
+        sin:x=>typeof x==='number'?Math.sin(x):null,
+        cos:x=>typeof x==='number'?Math.cos(x):null,
+        tanh:x=>typeof x==='number'?Math.tanh(x):null,
+        exp:x=>typeof x==='number'?Math.exp(x):null,
+        abs:x=>typeof x==='number'?Math.abs(x):null,
+        relu:x=>typeof x==='number'?Math.max(0,x):null,
+        sigmoid:x=>typeof x==='number'?1/(1+Math.exp(-x)):null,
+        erf:T.erf,softplus:T.softplus,
+        nn:{functional:{softplus:T.softplus}},
+      };
+      const fn=new Function('x','torch','return ('+expr+')');
+      const xs=Array.from({length:80},(_,i)=>-4+i*8/79);
+      const ys=xs.map(xv=>{try{const r=fn(xv,torch);return+r;}catch{return NaN;}});
+      if(ys.some(v=>!isFinite(v)||isNaN(v))) throw new Error('Produces NaN/Inf — check expression');
+      // Numeric derivative
+      const h=0.001;
+      const dys=xs.map(xv=>{
+        try{return(fn(xv+h,torch)-fn(xv-h,torch))/(2*h);}catch{return 0;}
+      });
+      const f0=+fn(0,torch).toFixed(5), f1=+fn(1,torch).toFixed(5);
+      const mn=+Math.min(...ys).toFixed(3), mx=+Math.max(...ys).toFixed(3);
+      sl.textContent=`✓ f(0)=${f0}  f(1)=${f1}  range [${mn},${mx}]`;
+      sl.className='act-status ok';
+      drawActPreview(xs,ys,dys);
+      showActMetrics({f0,f1,min:mn,max:mx,dy:dys});
+    }catch(e){sl.textContent='✗ '+e.message;sl.className='act-status err';}
+  } else {
+    sl.textContent='Code/Parametric modes require live backend'; sl.className='act-status wait';
+  }
+}
+
+function drawActPreview(xs,ys,dys){
+  document.getElementById('act-prev-empty').style.display='none';
+  const c=document.getElementById('ch-act-prev'); if(!c)return;
+  _actPrevChart?.destroy(); _actPrevChart=null;
+  const base={...CBase,parsing:{xAxisKey:'x',yAxisKey:'y'},
+    scales:{...CBase.scales,x:{...CBase.scales.x,type:'linear',
+      ticks:{...CBase.scales.x.ticks,color:'#4b5a73',maxTicksLimit:7}}}};
+  _actPrevChart=new Chart(c,{type:'line',data:{datasets:[
+    {data:xs.map((x,i)=>({x,y:ys[i]})),borderColor:'var(--cyan)',borderWidth:2,pointRadius:0,tension:.2,fill:false,label:'f(x)'},
+    ...(dys?[{data:xs.map((x,i)=>({x,y:dys[i]})),borderColor:'rgba(251,191,36,.5)',borderWidth:1.2,pointRadius:0,tension:.2,fill:false,label:"f'(x)"}]:[]),
+  ]},options:{...base,plugins:{...base.plugins,legend:{display:true,labels:{color:'#94a3b8',font:{size:8},boxWidth:8}}}}});
+}
+
+function showActMetrics(d){
+  document.getElementById('act-metrics').style.display='grid';
+  document.getElementById('am-f0').textContent=d.f0!=null?d.f0:'—';
+  document.getElementById('am-f1').textContent=d.f1!=null?d.f1:'—';
+  document.getElementById('am-range').textContent=d.min!=null?`[${d.min},${d.max}]`:'—';
+  // Suitability and gradient flow filled async
+}
+
+async function runSuitability(expr, url){
+  try{
+    const r=await fetch(url+'/api/act_suitability',{method:'POST',
+      headers:{'Content-Type':'application/json'},body:JSON.stringify({expr,pde:S.pde}),
+      signal:AbortSignal.timeout(6000)});
+    const d=await r.json();
+    if(d.ok){
+      document.getElementById('am-suit').textContent=(d.score*100).toFixed(1)+'%';
+      document.getElementById('am-rank').textContent=`#${d.rank}/${d.total}`;
+    }
+  }catch{}
+  // Gradient flow
+  try{
+    const r=await fetch(url+'/api/act_gradflow',{method:'POST',
+      headers:{'Content-Type':'application/json'},body:JSON.stringify({expr,depth:5,in_dim:2}),
+      signal:AbortSignal.timeout(6000)});
+    const d=await r.json();
+    if(d.ok&&d.analysis){
+      const flow=d.analysis;
+      const status=flow.vanishing?'van':flow.exploding?'exp':'OK';
+      document.getElementById('am-grad').textContent=status;
+      document.getElementById('am-grad').style.color=flow.vanishing||flow.exploding?'var(--amber)':'var(--green)';
+    }
+  }catch{}
+}
+
+async function optimizeParametric(){
+  if(!S.live||!S.backendOk){tlog('Parametric optimization requires live backend','err');return;}
+  const template=document.getElementById('act-para-template').value.trim();
+  if(!template){tlog('Enter a template expression','err');return;}
+  const params=document.getElementById('act-para-params').value.split(',').map(s=>s.trim()).filter(Boolean);
+  const st=document.getElementById('act-status');
+  st.textContent='Optimizing parameters…'; st.className='act-status wait';
+  try{
+    const url=getWS().replace(/^ws/,'http').replace('/ws','');
+    const r=await fetch(url+'/api/act_parametric',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({template,param_names:params,pde:S.pde,n_iters:60}),
+      signal:AbortSignal.timeout(30000)});
+    const d=await r.json();
+    if(d.ok&&d.result){
+      const res=d.result;
+      st.textContent=`✓ Optimized: score=${res.best_score?.toFixed(4)} · expr: ${res.best_expr?.slice(0,40)}`;
+      st.className='act-status ok';
+      // Auto-fill math mode with optimized expression
+      document.getElementById('act-expr').value=res.best_expr||template;
+      setActMode('math'); debounceActVal();
+    } else {
+      st.textContent='✗ '+(d.error||'failed'); st.className='act-status err';
+    }
+  }catch(e){st.textContent='✗ '+e.message;st.className='act-status err';}
+}
+
+/* ══════════════════════════════════════════════════════════════════
+   3D SNAPSHOT EXPORT — PNG + JSON data
+══════════════════════════════════════════════════════════════════ */
+let _snapshots=[];
+
+async function snapshot3D(){
+  if(!S.field3d?.x?.length){tlog('No 3D field data — train Maxwell model first','err');return;}
+  const ti=S.animIdx??getTIdx();
+  const ts=new Date().toISOString().replace(/[:.]/g,'-');
+  const id='snap_'+ts;
+
+  // 1. Download PNG via Plotly (triggers browser download)
+  try{
+    await Plotly.downloadImage('plot3d',{format:'png',width:1400,height:900,scale:2,filename:'pinn_3d_'+ts});
+  }catch(e){tlog('PNG export: '+e.message,'err');}
+
+  // 2. Build JSON data export
+  const {Ep,Bp,Et,Bt}=_getFrame(S.field3d,ti);
+  const t_val=(S.field3d.t??[])[ti]??0;
+  const errE=Ep.map((v,i)=>Math.abs(v-(Et[i]??0)));
+  const mse=errE.reduce((a,b)=>a+b*b,0)/Math.max(errE.length,1);
+  const jsonData={
+    exported_at: new Date().toISOString(),
+    mode: _3dMode, layout: _3dLayout,
+    t: t_val, t_index: ti,
+    pde: S.field3d.pde||'maxwell',
+    nx: S.field3d.nx||S.field3d.x?.length,
+    nt: S.field3d.nt||S.field3d.t?.length,
+    x: S.field3d.x,
+    E_pred: Ep, B_pred: Bp,
+    E_true: Et, B_true: Bt,
+    error_E: errE,
+    metrics: {
+      rmse_E: Math.sqrt(mse).toFixed(6),
+      max_err_E: Math.max(...errE).toFixed(6),
+      mean_err_E: (errE.reduce((a,b)=>a+b,0)/errE.length).toFixed(6),
+    },
+    full_grid: {
+      x: S.field3d.x, t: S.field3d.t,
+      E_pred: S.field3d.E_pred, B_pred: S.field3d.B_pred,
+      E_true: S.field3d.E_true, B_true: S.field3d.B_true,
+    },
+  };
+  const blob=new Blob([JSON.stringify(jsonData,null,2)],{type:'application/json'});
+  const a=document.createElement('a');
+  a.href=URL.createObjectURL(blob);
+  a.download='pinn_field_'+ts+'.json';
+  a.click();
+
+  // 3. Add to gallery
+  _snapshots.push({id,ts,t:t_val,mode:_3dMode,metrics:jsonData.metrics});
+  updateSnapGallery();
+
+  // 4. Enrich with backend metadata if available
+  if(S.live&&S.backendOk){
+    try{
+      const url=getWS().replace(/^ws/,'http').replace('/ws','');
+      fetch(url+'/api/snapshot_meta',{method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({field_grid:S.field3d})}).then(r=>r.json()).then(d=>{
+          if(d.ok) tlog(`Snapshot metadata: RMSE=${d.meta.E_error?.rmse??'—'} rel_l2=${d.meta.E_error?.rel_l2??'—'}`,'ok');
+        }).catch(()=>{});
+    }catch{}
+  }
+  tlog(`Snapshot saved: t=${t_val.toFixed(3)} · mode=${_3dMode}`,'ok');
+}
+
+function updateSnapGallery(){
+  const g=document.getElementById('snap-gallery'); if(!g)return;
+  if(!_snapshots.length){g.style.display='none';return;}
+  g.style.display='flex';
+  g.innerHTML=_snapshots.slice(-8).reverse().map((s,i)=>`
+    <div style="display:flex;flex-direction:column;align-items:center;gap:3px">
+      <div style="width:60px;height:44px;background:var(--surf);border:1px solid var(--bdr2);border-radius:3px;
+                  display:flex;align-items:center;justify-content:center;cursor:pointer;font-size:18px"
+           title="t=${s.t?.toFixed(2)} ${s.mode}" onclick="tlog('Snap ${i+1}: t=${(s.t||0).toFixed(3)} mode=${s.mode} RMSE=${s.metrics?.rmse_E||\'—\'} max_err=${s.metrics?.max_err_E||\'—\'}','ok')">
+        📷
+      </div>
+      <div style="font-size:8px;font-family:var(--mono);color:var(--txt3)">t=${(s.t||0).toFixed(2)}</div>
+    </div>`).join('');
+}
+
+/* ══════════════════════════════════════════════════════════════════
+   PYTHON TERMINAL
+══════════════════════════════════════════════════════════════════ */
+let _termHistory=[], _termHistIdx=-1, _termCellId=0;
+
+function onTermKey(e){
+  if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();runTerm();return;}
+  if(e.key==='ArrowUp'){
+    if(_termHistory.length&&_termHistIdx<_termHistory.length-1){
+      _termHistIdx++;
+      document.getElementById('term-inp').value=_termHistory[_termHistory.length-1-_termHistIdx]||'';
+    }
+    e.preventDefault();
+  }
+  if(e.key==='ArrowDown'){
+    if(_termHistIdx>0){_termHistIdx--;document.getElementById('term-inp').value=_termHistory[_termHistory.length-1-_termHistIdx]||'';}
+    else{_termHistIdx=-1;document.getElementById('term-inp').value='';}
+    e.preventDefault();
+  }
+}
+
+async function runTerm(){
+  const inp=document.getElementById('term-inp');
+  const code=inp.value.trim(); if(!code)return;
+  inp.value=''; _termHistIdx=-1;
+  _termHistory.push(code);
+  if(_termHistory.length>200) _termHistory.shift();
+
+  appendTermLine('in', code);
+  if(!S.live||!S.backendOk){
+    appendTermLine('err','Backend not connected — enable Live PyTorch');return;
+  }
+  _termCellId++;
+  const cellId='c'+_termCellId;
+  try{
+    const url=getWS().replace(/^ws/,'http').replace('/ws','');
+    const r=await fetch(url+'/api/exec',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({code,cell_id:cellId}),
+      signal:AbortSignal.timeout(30000)});
+    const d=await r.json();
+    if(d.output) appendTermLine(d.ok?'out':'err', d.output);
+    else if(!d.ok) appendTermLine('err','Error (no output)');
+    updateTermVars();
+  }catch(e){appendTermLine('err','Request failed: '+e.message);}
+}
+
+async function runEditor(){
+  const code=document.getElementById('term-editor').value.trim();
+  if(!code)return;
+  if(!S.live||!S.backendOk){appendTermLine('err','Backend not connected');return;}
+  _termCellId++;
+  const lines=code.split('\n');
+  appendTermLine('in',lines.length>1?lines[0]+'  … ('+lines.length+' lines)':code);
+  try{
+    const url=getWS().replace(/^ws/,'http').replace('/ws','');
+    const r=await fetch(url+'/api/exec',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({code,cell_id:'e'+_termCellId}),
+      signal:AbortSignal.timeout(60000)});
+    const d=await r.json();
+    if(d.output) appendTermLine(d.ok?'out':'err',d.output);
+    updateTermVars();
+  }catch(e){appendTermLine('err',e.message);}
+}
+
+function clearEditor(){document.getElementById('term-editor').value='';}
+function copyEditor(){navigator.clipboard.writeText(document.getElementById('term-editor').value).catch(()=>{});}
+
+async function termReset(){
+  if(!S.live||!S.backendOk){appendTermLine('err','Backend required');return;}
+  try{
+    const url=getWS().replace(/^ws/,'http').replace('/ws','');
+    await fetch(url+'/api/exec',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({reset:true,cell_id:'reset'})});
+    document.getElementById('term-output').innerHTML='<div class="term-cell"><span class="term-dim"># Session reset.</span></div>';
+    document.getElementById('term-vars').textContent='—';
+  }catch(e){appendTermLine('err',e.message);}
+}
+
+function termSnip(code){
+  document.getElementById('term-editor').value=code;
+  // terminal removed
+}
+
+function appendTermLine(type,text){
+  const out=document.getElementById('term-output'); if(!out)return;
+  const cell=document.createElement('div');
+  cell.className='term-cell';
+  const prefix=type==='in'?'<span class="term-prompt">&gt;&gt;&gt;</span>':'';
+  const cls=type==='in'?'term-in':type==='err'?'term-err':type==='dim'?'term-dim':'term-out';
+  // Escape HTML and preserve newlines
+  const esc=text.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\n/g,'<br>');
+  cell.innerHTML=`${prefix}<span class="${cls}">${esc}</span>`;
+  out.appendChild(cell);
+  out.scrollTop=out.scrollHeight;
+}
+
+async function updateTermVars(){
+  if(!S.live||!S.backendOk)return;
+  try{
+    const url=getWS().replace(/^ws/,'http').replace('/ws','');
+    const r=await fetch(url+'/api/exec',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({code:"[k+': '+type(v).__name__ for k,v in dict(vars()).items() if not k.startswith('_') and k not in ('print','torch','np','math')]",cell_id:'vars'})});
+    const d=await r.json();
+    const el=document.getElementById('term-vars');
+    if(el&&d.ok) el.textContent=d.output||'(empty session)';
+  }catch{}
+}
+
+// Set terminal env info when backend connects
+function updateTerminalEnv(){
+  const el=document.getElementById('term-env');
+  if(!el)return;
+  if(S.live&&S.backendOk) el.textContent=document.getElementById('backend-msg').textContent;
+  else el.textContent='— connect backend —';
+}
+
+/* ══════════════════════════════════════════════════════════════════
+   PATCH: updateStatus to also refresh terminal env
+══════════════════════════════════════════════════════════════════ */
+const _origUpdateStatus=updateStatus;
+function updateStatus(){
+  _origUpdateStatus();
+  updateTerminalEnv();
+}
+</script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/plotly.js/2.27.0/plotly.min.js"></script>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#0e1117;--surf:#161b27;--surf2:#1c2333;--bdr:#252e42;--bdr2:#2f3a52;
+  --blue:#3b82f6;--cyan:#06b6d4;--green:#22c55e;--amber:#f59e0b;
+  --red:#ef4444;--violet:#8b5cf6;
+  --txt:#e2e8f0;--txt2:#94a3b8;--txt3:#4b5a73;
+  --mono:'JetBrains Mono','Fira Code',monospace;
+  --E:#ef4444;--B:#3b82f6;
+}
+html,body{height:100%;overflow:hidden;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;font-size:13px;background:var(--bg);color:var(--txt)}
+::-webkit-scrollbar{width:4px;height:4px}
+::-webkit-scrollbar-thumb{background:var(--bdr2);border-radius:2px}
+.shell{display:grid;grid-template-columns:268px 1fr;grid-template-rows:50px 1fr 28px;height:100vh}
+.topbar{grid-column:1/-1;background:var(--surf);border-bottom:1px solid var(--bdr);display:flex;align-items:center;padding:0 16px;gap:12px}
+.topbar-title{font-size:15px;font-weight:700;color:#fff;white-space:nowrap}
+.topbar-sub{font-size:11px;color:var(--txt2);font-family:var(--mono)}
+.pill{padding:2px 8px;border-radius:10px;font-size:10px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;border:1px solid}
+.pill-blue{background:#1e3a5f;border-color:var(--blue);color:var(--blue)}
+.pill-green{background:#14351f;border-color:var(--green);color:var(--green)}
+.pill-amber{background:#3d2c08;border-color:var(--amber);color:var(--amber)}
+.dot{width:8px;height:8px;border-radius:50%;background:var(--txt3);flex-shrink:0;transition:background .3s}
+.dot.live{background:var(--green);box-shadow:0 0 6px var(--green)}
+.dot.run{background:var(--blue);animation:pulse .9s infinite}
+.dot.err{background:var(--red)}
+@keyframes pulse{0%,100%{opacity:1;box-shadow:0 0 4px var(--blue)}50%{opacity:.4;box-shadow:none}}
+
+/* Sidebar */
+.sidebar{background:var(--surf);border-right:1px solid var(--bdr);overflow-y:auto}
+.sec{border-bottom:1px solid var(--bdr);padding:11px 13px}
+.sec-t{font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:.1em;color:var(--txt3);margin-bottom:8px}
+.field{margin-bottom:9px}
+.field-l{font-size:11px;color:var(--txt2);margin-bottom:3px;display:flex;justify-content:space-between;align-items:center}
+.sl-row{display:flex;align-items:center;gap:6px}
+.sl-row input[type=range]{flex:1;height:2px;-webkit-appearance:none;background:var(--bdr2);border-radius:2px;outline:none;cursor:pointer}
+.sl-row input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:12px;height:12px;border-radius:50%;background:var(--blue);cursor:pointer;border:2px solid var(--surf)}
+.nb{width:64px;padding:3px 6px;border:1px solid var(--bdr2);border-radius:3px;font-size:11px;font-family:var(--mono);text-align:right;background:var(--surf2);color:var(--txt);outline:none}
+.nb:focus{border-color:var(--blue)}
+select{width:100%;padding:4px 8px;border:1px solid var(--bdr2);border-radius:3px;font-size:12px;background:var(--surf2);color:var(--txt);outline:none;cursor:pointer}
+select:focus{border-color:var(--blue)}
+.seg{display:flex;border:1px solid var(--bdr2);border-radius:3px;overflow:hidden;margin-bottom:6px}
+.seg-o{flex:1;padding:4px;text-align:center;font-size:11px;font-weight:500;cursor:pointer;border-right:1px solid var(--bdr2);color:var(--txt2);background:var(--surf2);transition:all .12s;white-space:nowrap}
+.seg-o:last-child{border-right:none}
+.seg-o.on{background:var(--blue);color:#fff;border-color:var(--blue)}
+.seg-o:hover:not(.on){background:var(--surf);color:var(--txt)}
+.tog-row{display:flex;justify-content:space-between;align-items:center;margin-bottom:6px}
+.tog{width:32px;height:17px;border-radius:9px;cursor:pointer;position:relative;border:1px solid var(--bdr2);background:var(--surf2);transition:all .15s;flex-shrink:0}
+.tog.on{background:var(--blue);border-color:var(--blue)}
+.tog::after{content:'';position:absolute;top:2px;width:11px;height:11px;border-radius:50%;background:#fff;transition:left .15s;box-shadow:0 1px 2px rgba(0,0,0,.4)}
+.tog.on::after{left:17px}.tog.off::after{left:2px}
+.btn{padding:5px 12px;border-radius:3px;font-size:12px;font-weight:600;cursor:pointer;border:1px solid;transition:all .12s}
+.btn-blue{background:var(--blue);border-color:var(--blue);color:#fff}
+.btn-blue:hover:not(:disabled){background:#2563eb}
+.btn-red{background:var(--surf2);border-color:var(--red);color:var(--red)}
+.btn-red:hover{background:#3c1414}
+.btn-gray{background:var(--surf2);border-color:var(--bdr2);color:var(--txt2)}
+.btn-gray:hover{border-color:var(--txt2);color:var(--txt)}
+.btn-amber{background:var(--surf2);border-color:var(--amber);color:var(--amber)}
+.btn-amber:hover{background:#3d2c08}
+.btn:disabled{opacity:.4;cursor:not-allowed}
+.btn-row{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
+.cb-l{display:flex;align-items:center;gap:5px;font-size:11px;color:var(--txt2);cursor:pointer;margin-bottom:3px}
+.cb-l input{cursor:pointer;accent-color:var(--blue)}
+
+/* Content */
+.content{overflow:hidden;display:flex;flex-direction:column}
+.tabs{display:flex;border-bottom:1px solid var(--bdr);background:var(--surf);padding:0 14px;flex-shrink:0}
+.tab{padding:10px 13px;font-size:12px;cursor:pointer;border-bottom:2px solid transparent;color:var(--txt2);margin-bottom:-1px;transition:color .12s;white-space:nowrap}
+.tab.on{color:var(--blue);border-bottom-color:var(--blue);font-weight:600}
+.tab:hover:not(.on){color:var(--txt)}
+.tb{padding:13px;overflow-y:auto;flex:1;display:none}
+.tb.on{display:block}
+
+/* Cards */
+.card{background:var(--surf);border:1px solid var(--bdr);border-radius:5px;padding:12px 13px;margin-bottom:10px}
+.card-t{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.08em;color:var(--txt3);margin-bottom:9px}
+
+/* KPIs */
+.kpi-row{display:grid;gap:7px;margin-bottom:11px}
+.kpi-row.c5{grid-template-columns:repeat(5,1fr)}
+.kpi-row.c4{grid-template-columns:repeat(4,1fr)}
+.kpi-row.c6{grid-template-columns:repeat(6,1fr)}
+.kpi{background:var(--surf);border:1px solid var(--bdr);border-radius:4px;padding:8px 10px}
+.kpi-l{font-size:9px;text-transform:uppercase;letter-spacing:.07em;color:var(--txt3);margin-bottom:3px}
+.kpi-v{font-size:19px;font-family:var(--mono);color:#fff;font-weight:500}
+.kpi-v.good{color:var(--green)}.kpi-v.warn{color:var(--amber)}.kpi-v.bad{color:var(--red)}.kpi-v.blue{color:var(--cyan)}
+.kpi-sub{font-size:9px;color:var(--txt3);margin-top:1px;font-family:var(--mono)}
+
+/* Progress */
+.prog-bg{background:var(--bdr2);border-radius:2px;height:3px}
+.prog-fill{height:100%;border-radius:2px;background:var(--blue);transition:width .4s ease}
+.prog-label{display:flex;justify-content:space-between;font-size:10px;font-family:var(--mono);color:var(--txt2);margin-bottom:3px}
+
+/* Charts */
+.ch-wrap{position:relative}
+.ch-wrap.h160{height:160px}.ch-wrap.h200{height:200px}.ch-wrap.h220{height:220px}
+.ch-wrap.h260{height:260px}.ch-wrap.h320{height:320px}.ch-wrap.h380{height:380px}
+.ch-empty{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-size:12px;color:var(--txt3);pointer-events:none}
+
+/* Log */
+.log{background:#080c14;border-radius:3px;overflow-y:auto;padding:7px 9px;font-family:var(--mono);font-size:10.5px;line-height:1.65}
+.log.h80{height:80px}.log.h120{height:120px}.log.h150{height:150px}
+.log-ok{color:#4ade80}.log-err{color:#f87171}.log-info{color:var(--txt2)}.log-dim{color:var(--txt3)}
+
+/* Grid */
+.g2{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.g3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px}
+.g32{display:grid;grid-template-columns:3fr 2fr;gap:10px}
+.g21{display:grid;grid-template-columns:2fr 1fr;gap:10px}
+
+/* Leaderboard */
+.lb-hdr{display:grid;grid-template-columns:24px 1fr 100px 70px 55px;gap:4px;padding:4px 7px;font-size:9px;text-transform:uppercase;letter-spacing:.07em;color:var(--txt3);border-bottom:1px solid var(--bdr)}
+.lb-row{display:grid;grid-template-columns:24px 1fr 100px 70px 55px;gap:4px;padding:5px 7px;border-radius:3px;align-items:center;font-size:11px;font-family:var(--mono);border:1px solid transparent;margin-bottom:2px;cursor:pointer;transition:background .1s}
+.lb-row:hover{background:var(--surf2)}
+.lb-row.r1{background:#0f291030;border-color:#166534}.lb-row.r2{background:#0f1f4020;border-color:#1d4ed8}.lb-row.r3{background:#2c1f0820;border-color:#92400e}
+.lb-rank{font-weight:700;color:var(--txt3)}.r1 .lb-rank{color:var(--green)}.r2 .lb-rank{color:var(--blue)}.r3 .lb-rank{color:var(--amber)}
+.lb-bar-bg{background:var(--bdr2);border-radius:2px;height:5px}.lb-bar{height:100%;border-radius:2px;transition:width .6s ease}
+
+/* Act checkboxes grid */
+.act-grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:1px 6px;margin-bottom:6px}
+.tag-inp{width:100%;padding:4px 7px;border:1px solid var(--bdr2);border-radius:3px;font-size:11px;font-family:var(--mono);background:var(--surf2);color:var(--txt);outline:none}
+.tag-inp:focus{border-color:var(--blue)}
+
+/* Winner */
+.winner-card{background:linear-gradient(135deg,#0a2e1a,#0f1f40);border:1px solid var(--green);border-radius:5px;padding:13px;margin-bottom:10px;display:none}
+.winner-card h2{font-size:22px;font-family:var(--mono);color:var(--green);margin-bottom:3px}
+
+/* Data table */
+.mtable{width:100%;border-collapse:collapse;font-size:11px}
+.mtable th{text-align:left;padding:4px 8px;font-size:9px;text-transform:uppercase;letter-spacing:.07em;color:var(--txt3);border-bottom:1px solid var(--bdr)}
+.mtable td{padding:5px 8px;border-bottom:1px solid var(--bdr2);font-family:var(--mono)}
+.mtable tr:hover td{background:var(--surf2)}
+
+/* ── 3D FIELD SPECIFIC ── */
+.plot3d-wrap{border:1px solid var(--bdr);border-radius:5px;overflow:hidden;background:#090d15}
+.field-controls{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:10px}
+.t-slider-row{display:flex;align-items:center;gap:10px;margin-bottom:10px}
+.t-slider-row input[type=range]{flex:1;height:3px;-webkit-appearance:none;background:var(--bdr2);border-radius:2px;cursor:pointer}
+.t-slider-row input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:14px;height:14px;border-radius:50%;background:var(--cyan);cursor:pointer;border:2px solid var(--surf)}
+.math-box{background:#080c14;border-radius:4px;padding:10px 12px;font-family:var(--mono);font-size:11px;line-height:2;color:var(--cyan);border:1px solid var(--bdr)}
+.math-box.maxwell{color:var(--cyan)}.math-box.harmonic{color:#c084fc}.math-box.burgers{color:var(--green)}.math-box.heat{color:var(--amber)}
+.ldot{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:4px;vertical-align:middle}
+
+/* Footer */
+.footer{grid-column:1/-1;background:var(--surf);border-top:1px solid var(--bdr);display:flex;align-items:center;padding:0 13px;justify-content:space-between;font-size:10px;font-family:var(--mono);color:var(--txt3)}
+
+/* ══ Custom Activation Builder ══════════════════════════════════ */
+.act-builder{display:none;margin-top:9px;background:#06080e;border:1px solid var(--bdr2);border-radius:4px;padding:11px 12px}
+.act-tab-row{display:flex;gap:0;margin-bottom:9px;border:1px solid var(--bdr2);border-radius:3px;overflow:hidden}
+.act-tab{flex:1;padding:4px 6px;font-size:10px;font-weight:600;text-align:center;cursor:pointer;color:var(--txt3);background:var(--surf2);transition:all .12s;border-right:1px solid var(--bdr2)}
+.act-tab:last-child{border-right:none}.act-tab.on{background:var(--cyan);color:#000}
+.act-expr-wrap{position:relative}
+.act-expr{width:100%;padding:7px 9px;background:var(--surf2);border:1px solid var(--bdr2);border-radius:3px;font-family:var(--mono);font-size:12px;color:var(--cyan);outline:none;transition:border-color .15s}
+.act-expr:focus{border-color:var(--cyan)}
+.act-code{width:100%;padding:7px 9px;background:var(--surf2);border:1px solid var(--bdr2);border-radius:3px;font-family:var(--mono);font-size:11px;color:#a3e635;outline:none;resize:vertical;min-height:88px;transition:border-color .15s;line-height:1.55}
+.act-code:focus{border-color:#a3e635}
+.act-code::placeholder{color:var(--txt3);font-size:10px}
+.act-status{font-size:10px;font-family:var(--mono);margin-top:5px;min-height:14px}
+.act-status.ok{color:var(--green)}.act-status.err{color:var(--red)}.act-status.wait{color:var(--amber)}
+.act-prev-wrap{margin-top:8px;height:66px;border:1px solid var(--bdr);border-radius:3px;background:#03050a;position:relative}
+.act-prev-empty{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-size:10px;color:var(--txt3);pointer-events:none}
+.tok-row{display:flex;flex-wrap:wrap;gap:3px;margin-top:7px}
+.tok{padding:2px 7px;border-radius:3px;font-size:9px;font-family:var(--mono);background:var(--surf2);border:1px solid var(--bdr2);color:var(--cyan);cursor:pointer;user-select:none;transition:all .1s}
+.tok:hover{background:var(--bdr2);color:#fff}
+.act-info{font-size:9px;color:var(--txt3);margin-top:6px;line-height:1.65}
+.act-metrics{display:grid;grid-template-columns:1fr 1fr 1fr;gap:5px;margin-top:8px}
+.act-met{background:var(--surf2);border:1px solid var(--bdr);border-radius:3px;padding:5px 7px;text-align:center}
+.act-met-l{font-size:8px;color:var(--txt3);text-transform:uppercase;letter-spacing:.07em}
+.act-met-v{font-size:12px;font-family:var(--mono);color:var(--cyan);font-weight:500}
+
+/* ══ Enhanced 3D Controls ════════════════════════════════════════ */
+.f3d-toolbar{display:flex;gap:6px;align-items:center;flex-wrap:wrap;padding:8px 10px;background:var(--surf2);border-radius:3px;margin-bottom:8px}
+.f3d-toolbar .label{font-size:10px;color:var(--txt3);white-space:nowrap}
+.export-row{display:flex;gap:6px;align-items:center;margin-top:8px;flex-wrap:wrap}
+.snap-thumb{width:48px;height:36px;border-radius:3px;border:1px solid var(--bdr);cursor:pointer;object-fit:cover;transition:border-color .1s}
+.snap-thumb:hover{border-color:var(--cyan)}
+.snap-gallery{display:flex;gap:6px;flex-wrap:wrap;margin-top:6px;min-height:0}
+
+/* ══ Python Terminal ════════════════════════════════════════════ */
+.terminal{background:#02040a;border:1px solid var(--bdr);border-radius:4px;overflow:hidden;display:flex;flex-direction:column;height:400px}
+.term-output{flex:1;overflow-y:auto;padding:8px 11px;font-family:var(--mono);font-size:11px;line-height:1.65}
+.term-output::-webkit-scrollbar{width:3px}.term-output::-webkit-scrollbar-thumb{background:var(--bdr2)}
+.term-cell{margin-bottom:4px}
+.term-in{color:#a3e635}.term-out{color:var(--txt2)}.term-err{color:#f87171}.term-dim{color:var(--txt3)}
+.term-prompt{color:var(--cyan);font-weight:700;margin-right:4px;user-select:none}
+.term-input-row{display:flex;align-items:center;border-top:1px solid var(--bdr);background:#03060e;padding:6px 10px;gap:6px}
+.term-inp{flex:1;background:transparent;border:none;outline:none;font-family:var(--mono);font-size:11px;color:#a3e635;caret-color:var(--cyan)}
+.term-inp::placeholder{color:var(--txt3)}
+.term-header{background:var(--surf2);border-bottom:1px solid var(--bdr);padding:7px 11px;display:flex;justify-content:space-between;align-items:center}
+.term-title{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.1em;color:var(--txt3)}
+.term-env{font-size:9px;font-family:var(--mono);color:var(--txt3)}
+.snippet-row{display:flex;gap:5px;flex-wrap:wrap;padding:7px 11px;border-bottom:1px solid var(--bdr);background:var(--surf2)}
+.snip{padding:2px 7px;border-radius:3px;font-size:9px;font-family:var(--mono);background:var(--surf2);border:1px solid var(--bdr2);color:#a3e635;cursor:pointer;user-select:none;transition:all .1s}
+.snip:hover{background:var(--bdr);color:#fff}
+</style>
+</head>
+<body>
+<div class="shell">
+
+<!-- ══ TOPBAR ══════════════════════════════════════════════ -->
+<div class="topbar">
+  <span class="topbar-title">PINN Research Platform</span>
+  <span class="topbar-sub" id="top-sub">Harmonic ODE · cos · Demo</span>
+  <div style="margin-left:auto;display:flex;align-items:center;gap:10px">
+    <span class="pill" id="pill-mode">DEMO</span>
+    <span class="pill pill-green" id="pill-pde">Harmonic</span>
+    <div style="display:flex;align-items:center;gap:6px;font-size:11px;color:var(--txt2)">
+      <span class="dot" id="dot"></span>
+      <span id="status-txt">Demo mode</span>
+    </div>
+  </div>
+</div>
+
+<!-- ══ SIDEBAR ═════════════════════════════════════════════ -->
+<aside class="sidebar">
+
+  <div class="sec">
+    <div class="sec-t">Backend Connection</div>
+    <div class="tog-row">
+      <span style="font-size:12px;color:var(--txt)">Live PyTorch</span>
+      <div class="tog off" id="tgl-live" onclick="toggleLive()"></div>
+    </div>
+    <div id="backend-box" style="display:none">
+      <input type="text" id="ws-url" value="ws://localhost:8765/ws" oninput="probeBackend()" style="width:100%;padding:4px 8px;border:1px solid var(--bdr2);border-radius:3px;font-size:11px;font-family:var(--mono);background:var(--surf2);color:var(--txt);outline:none;margin-bottom:4px">
+      <div id="backend-msg" style="font-size:10px;font-family:var(--mono);color:var(--txt3)"></div>
+    </div>
+    <div style="font-size:10px;color:var(--txt3);line-height:1.7;margin-top:5px">Demo mode runs simulations without PyTorch. Toggle <em>Live PyTorch</em> to connect your local training server.</div>
+  </div>
+
+  <div class="sec">
+    <div class="sec-t">Physics Problem</div>
+    <div class="seg">
+      <div class="seg-o on" id="seg-hrm" onclick="setPDE('harmonic')">Harmonic ODE</div>
+      <div class="seg-o"    id="seg-mxw" onclick="setPDE('maxwell')">Maxwell EM</div>
+    </div>
+    <div class="seg">
+      <div class="seg-o" id="seg-brg" onclick="setPDE('burgers')">Burgers</div>
+      <div class="seg-o" id="seg-ht"  onclick="setPDE('heat')">Heat Eq.</div>
+    </div>
+    <div class="math-box" id="pde-mathbox">u″ + u = 0<br>u(0) = 0 · u(π/2) = 1<br>True: u = sin(x)</div>
+  </div>
+
+  <div class="sec">
+    <div class="sec-t">Activation Function</div>
+    <select id="sel-act" onchange="onActChange()">
+      <option value="cos">cos — SIREN / wave</option>
+      <option value="sin">sin</option>
+      <option value="sincos">sin + cos</option>
+      <option value="sin2x">sin(2x)</option>
+      <option value="tanh">tanh</option>
+      <option value="swish">swish</option>
+      <option value="gelu">gelu</option>
+      <option value="erf">erf</option>
+      <option value="morlet">morlet wavelet</option>
+      <option value="sinc">sinc</option>
+      <option value="damped_sin">damped sin</option>
+      <option value="mish">mish</option>
+      <option value="gaussian">gaussian</option>
+      <option value="isru">isru</option>
+      <option value="mex_hat">mexican hat</option>
+      <option value="selu">selu</option>
+      <option value="elu">elu</option>
+      <option value="__custom__">⚗ Custom expression…</option>
+    </select>
+
+    <!-- ── Custom Activation Builder ─────────────────── -->
+    <div class="act-builder" id="act-builder">
+      <div class="act-tab-row">
+        <div class="act-tab on" id="act-tab-math" onclick="setActMode('math')">f(x) Math</div>
+        <div class="act-tab"    id="act-tab-para" onclick="setActMode('para')">Parametric</div>
+      </div>
+
+      <!-- Math mode -->
+      <div id="act-mode-math">
+        <div style="font-size:10px;color:var(--txt2);margin-bottom:5px">Expression in <code style="color:var(--cyan)">x</code></div>
+        <input class="act-expr" id="act-expr" placeholder="x * torch.sin(x)"
+               oninput="debounceActVal()" autocomplete="off" spellcheck="false">
+        <div class="tok-row">
+          <span class="tok" onclick="insertTok('torch.sin(x)')">sin</span>
+          <span class="tok" onclick="insertTok('torch.cos(x)')">cos</span>
+          <span class="tok" onclick="insertTok('torch.tanh(x)')">tanh</span>
+          <span class="tok" onclick="insertTok('torch.exp(-x*x)')">e^-x²</span>
+          <span class="tok" onclick="insertTok('torch.abs(x)')" >|x|</span>
+          <span class="tok" onclick="insertTok('torch.sigmoid(x)')">σ</span>
+          <span class="tok" onclick="insertTok('torch.relu(x)')">relu</span>
+          <span class="tok" onclick="insertTok('torch.erf(x)')">erf</span>
+          <span class="tok" onclick="insertTok('x*x')">x²</span>
+          <span class="tok" onclick="insertTok('x*torch.sin(x)')">x·sin</span>
+          <span class="tok" onclick="insertTok('torch.cos(5*x)*torch.exp(-0.5*x*x)')">morlet</span>
+          <span class="tok" onclick="insertTok('(1-x*x)*torch.exp(-0.5*x*x)')">mex</span>
+          <span class="tok" onclick="insertTok('x/(1+x*x).sqrt()')">isru</span>
+          <span class="tok" onclick="insertTok('x*torch.tanh(torch.nn.functional.softplus(x))')">mish</span>
+        </div>
+      </div>
+
+
+      <!-- Parametric mode -->
+      <div id="act-mode-para" style="display:none">
+        <div style="font-size:10px;color:var(--txt2);margin-bottom:5px">Template with learnable parameters <code style="color:var(--cyan)">a, b, c</code></div>
+        <input class="act-expr" id="act-para-template"
+               placeholder="a * torch.sin(b * x) + c * x"
+               oninput="debounceActVal()" style="margin-bottom:4px">
+        <div style="font-size:10px;color:var(--txt3);margin-bottom:5px">Parameters (comma-separated): <input id="act-para-params" style="width:120px;padding:2px 6px;background:var(--surf2);border:1px solid var(--bdr2);border-radius:3px;font-family:var(--mono);font-size:10px;color:var(--cyan);outline:none" value="a, b, c"></div>
+        <button class="btn btn-gray" style="font-size:10px;padding:3px 8px" onclick="optimizeParametric()">⚙ Optimize for PDE</button>
+      </div>
+
+      <!-- Status + preview (shared across modes) -->
+      <div class="act-status wait" id="act-status">Select a mode and enter your expression</div>
+      <div class="act-prev-wrap">
+        <canvas id="ch-act-prev" style="width:100%;height:100%;display:block"></canvas>
+        <div class="act-prev-empty" id="act-prev-empty">— preview —</div>
+      </div>
+      <!-- Derivative preview -->
+      <div id="act-deriv-wrap" style="display:none;margin-top:4px;height:40px;border:1px solid var(--bdr);border-radius:3px;background:#03050a;position:relative">
+        <canvas id="ch-act-deriv" style="width:100%;height:100%;display:block"></canvas>
+        <div style="position:absolute;top:3px;left:6px;font-size:8px;color:var(--txt3);pointer-events:none">f'(x)</div>
+      </div>
+
+      <div class="act-metrics" id="act-metrics" style="display:none">
+        <div class="act-met"><div class="act-met-l">f(0)</div><div class="act-met-v" id="am-f0">—</div></div>
+        <div class="act-met"><div class="act-met-l">f(1)</div><div class="act-met-v" id="am-f1">—</div></div>
+        <div class="act-met"><div class="act-met-l">Range</div><div class="act-met-v" id="am-range">—</div></div>
+        <div class="act-met"><div class="act-met-l">Spectral</div><div class="act-met-v" id="am-suit">—</div></div>
+        <div class="act-met"><div class="act-met-l">Grad flow</div><div class="act-met-v" id="am-grad">—</div></div>
+        <div class="act-met"><div class="act-met-l">PDE rank</div><div class="act-met-v" id="am-rank">—</div></div>
+      </div>
+
+      <div class="act-info">
+        Namespace: <span style="color:var(--cyan);opacity:.55">torch sin cos tanh exp log sqrt abs relu sigmoid softplus erf selu swish F</span><br>
+        Math mode validates in browser · Parametric mode requires live backend
+      </div>
+    </div>
+  </div>
+
+  <div class="sec">
+    <div class="sec-t">Architecture</div>
+    <div class="field">
+      <div class="field-l">Hidden layers <span id="lv-depth" style="font-family:var(--mono);color:var(--cyan)">5</span></div>
+      <div class="sl-row">
+        <input type="range" id="sl-depth" min="1" max="9" value="5" oninput="sync('depth',+this.value)">
+        <input type="number" class="nb" id="nb-depth" value="5" min="1" max="20" onchange="syncNb('depth',+this.value)">
+      </div>
+    </div>
+    <div class="field">
+      <div class="field-l">Width per layer <span id="lv-width" style="font-family:var(--mono);color:var(--cyan)">128</span></div>
+      <div class="sl-row">
+        <input type="range" id="sl-width" min="8" max="512" step="8" value="128" oninput="sync('width',+this.value)">
+        <input type="number" class="nb" id="nb-width" value="128" min="8" max="512" step="8" onchange="syncNb('width',+this.value)">
+      </div>
+    </div>
+    <div style="font-size:10px;color:var(--txt3);font-family:var(--mono);margin-top:4px" id="param-est">≈ 99,970 params</div>
+  </div>
+
+  <div class="sec">
+    <div class="sec-t">Training</div>
+    <div class="field">
+      <div class="field-l">Epochs <span id="lv-ep" style="font-family:var(--mono);color:var(--amber)">2000</span></div>
+      <div class="sl-row">
+        <input type="range" id="sl-ep" min="200" max="8000" step="100" value="2000" oninput="sync('ep',+this.value)">
+        <input type="number" class="nb" id="nb-ep" value="2000" min="100" max="20000" step="100" onchange="syncNb('ep',+this.value)">
+      </div>
+    </div>
+    <div class="field">
+      <div class="field-l">Learning rate <span id="lv-lr" style="font-family:var(--mono);color:var(--amber)">1e-3</span></div>
+      <div class="sl-row">
+        <input type="range" id="sl-lr" min="-5" max="-1" step="0.25" value="-3" oninput="syncLR(+this.value)">
+        <input type="number" class="nb" id="nb-lr" value="0.001" style="width:72px" onchange="syncLRnb(+this.value)">
+      </div>
+    </div>
+    <div class="field">
+      <div class="field-l">Collocation pts <span id="lv-col" style="font-family:var(--mono);color:var(--amber)">2048</span></div>
+      <div class="sl-row">
+        <input type="range" id="sl-col" min="256" max="8192" step="256" value="2048" oninput="sync('col',+this.value)">
+        <input type="number" class="nb" id="nb-col" value="2048" min="64" max="16384" step="256" onchange="syncNb('col',+this.value)">
+      </div>
+    </div>
+    <div class="tog-row">
+      <span style="font-size:12px;color:var(--txt)">L-BFGS refinement</span>
+      <div class="tog on" id="tgl-lbfgs" onclick="togClick('lbfgs')"></div>
+    </div>
+    <div style="font-size:10px;color:var(--txt3);margin-top:2px">Adam → CosineAnnealing → L-BFGS (notebook default)</div>
+  </div>
+
+  <div class="sec">
+    <div class="btn-row">
+      <button class="btn btn-blue"  id="btn-run"  onclick="startSingle()">▶ Run</button>
+      <button class="btn btn-red"   id="btn-stop" onclick="stopAll()" style="display:none">■ Stop</button>
+    </div>
+    <div style="display:flex;gap:5px;margin-top:6px">
+      <button class="btn btn-gray" style="flex:1" onclick="goTab('search')">🔍 Search</button>
+      <button class="btn btn-amber" style="flex:1" onclick="goTab('sweep')">⚙ Sweep</button>
+    </div>
+  </div>
+
+</aside>
+
+<!-- ══ CONTENT ══════════════════════════════════════════════ -->
+<div class="content">
+<div class="tabs">
+  <div class="tab on" data-t="train"    onclick="goTab('train')">Training</div>
+  <div class="tab"    data-t="search"   onclick="goTab('search')">Activation Search</div>
+  <div class="tab"    data-t="sweep"    onclick="goTab('sweep')">Autonomous Sweep</div>
+  <div class="tab"    data-t="field3d"  onclick="goTab('field3d')">3D EM Field</div>
+  <div class="tab"    data-t="data"     onclick="goTab('data')">Data</div>
+</div>
+
+<!-- ═══════════════ TRAINING TAB ═══════════════════════════ -->
+<div class="tb on" id="tb-train">
+
+  <div class="kpi-row c5">
+    <div class="kpi"><div class="kpi-l">Epoch</div><div class="kpi-v blue" id="k-ep">—</div></div>
+    <div class="kpi"><div class="kpi-l">Accuracy</div><div class="kpi-v" id="k-acc">—</div></div>
+    <div class="kpi"><div class="kpi-l">Rel. L²</div><div class="kpi-v" id="k-l2">—</div></div>
+    <div class="kpi"><div class="kpi-l">PDE loss</div><div class="kpi-v" id="k-pde">—</div></div>
+    <div class="kpi"><div class="kpi-l">Elapsed</div><div class="kpi-v" id="k-t">—</div></div>
+  </div>
+
+  <div class="card" style="padding:9px 12px">
+    <div class="prog-label">
+      <span id="prog-lbl">Epoch</span>
+      <span style="display:flex;gap:14px;font-size:10px">
+        <span><span class="ldot" style="background:var(--blue)"></span>total</span>
+        <span><span class="ldot" style="background:var(--cyan)"></span>PDE</span>
+        <span><span class="ldot" style="background:var(--amber)"></span>wave</span>
+        <span><span class="ldot" style="background:var(--violet)"></span>BC</span>
+        <span id="prog-pct" style="margin-left:6px">0%</span>
+      </span>
+    </div>
+    <div class="prog-bg"><div class="prog-fill" id="prog-fill" style="width:0%"></div></div>
+    <div style="margin-top:4px;font-size:10px;font-family:var(--mono);color:var(--txt3)" id="loss-detail">—</div>
+  </div>
+
+  <div class="g3">
+    <div class="card">
+      <div class="card-t">Total Loss <span style="font-weight:400;color:var(--txt3)">(log)</span></div>
+      <div class="ch-wrap h160"><canvas id="ch-total"></canvas><div class="ch-empty" id="ce-total">Run training →</div></div>
+    </div>
+    <div class="card">
+      <div class="card-t">PDE + Wave Residual</div>
+      <div class="ch-wrap h160"><canvas id="ch-pde"></canvas><div class="ch-empty" id="ce-pde">—</div></div>
+    </div>
+    <div class="card">
+      <div class="card-t">Accuracy Ratio</div>
+      <div class="ch-wrap h160"><canvas id="ch-acc"></canvas><div class="ch-empty" id="ce-acc">—</div></div>
+    </div>
+  </div>
+
+  <div class="g32">
+    <div class="card">
+      <div class="card-t">Prediction vs Analytic Truth
+        <span style="float:right;font-size:10px;font-weight:400;color:var(--txt3)" id="pred-info"></span>
+      </div>
+      <div class="ch-wrap h200"><canvas id="ch-pred"></canvas><div class="ch-empty" id="ce-pred">—</div></div>
+    </div>
+    <div>
+      <div class="card">
+        <div class="card-t">Loss table (exact notebook format)</div>
+        <div id="loss-table" class="log h120"></div>
+      </div>
+      <div class="card" style="margin-top:0">
+        <div class="card-t">Log</div>
+        <div class="log h80" id="log-train"></div>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<!-- ═══════════════ ACTIVATION SEARCH TAB ═════════════════ -->
+<div class="tb" id="tb-search">
+  <div class="g2" style="align-items:start">
+    <div>
+      <div class="card">
+        <div class="card-t">Search configuration</div>
+        <p style="font-size:11px;color:var(--txt2);margin-bottom:10px;line-height:1.7">
+          Trains every selected activation with <em>identical</em> architecture and seed for fair comparison.
+          Produces the activation overlay chart from your notebook.
+        </p>
+        <div class="field">
+          <div class="field-l">Problem</div>
+          <div class="seg"><div class="seg-o on" id="ss-hrm" onclick="setSPDE('harmonic')">Harmonic ODE</div><div class="seg-o" id="ss-mxw" onclick="setSPDE('maxwell')">Maxwell EM</div></div>
+        </div>
+        <div class="g2" style="margin-bottom:8px">
+          <div class="field"><div class="field-l">Epochs / activation</div><div class="sl-row"><input type="range" id="sl-sep" min="200" max="5000" step="100" value="1000" oninput="sync('sep',+this.value)"><input type="number" class="nb" id="nb-sep" value="1000" min="100" max="8000" step="100" onchange="syncNb('sep',+this.value)"></div></div>
+          <div class="g2" style="gap:5px">
+            <div class="field"><div class="field-l">Width</div><input type="number" class="tag-inp" id="nb-sw" value="128" min="8" max="512" step="8"></div>
+            <div class="field"><div class="field-l">Depth</div><input type="number" class="tag-inp" id="nb-sd" value="5" min="1" max="10"></div>
+          </div>
+        </div>
+        <div class="field">
+          <div class="field-l">Activations to compare</div>
+          <div class="act-grid" id="search-act-grid"></div>
+          <div class="btn-row" style="margin-top:4px">
+            <button class="btn btn-gray" style="font-size:10px;padding:2px 7px" onclick="selAll('sa-cb',true)">All</button>
+            <button class="btn btn-gray" style="font-size:10px;padding:2px 7px" onclick="selAll('sa-cb',false)">None</button>
+            <button class="btn btn-gray" style="font-size:10px;padding:2px 7px" onclick="selWave('sa-cb')">Wave acts</button>
+          </div>
+        </div>
+        <div class="btn-row" style="margin-top:10px">
+          <button class="btn btn-blue"  id="btn-srch"      onclick="startSearch()">▶ Run Search</button>
+          <button class="btn btn-red"   id="btn-srch-stop" onclick="stopAll()" style="display:none">■ Stop</button>
+        </div>
+      </div>
+      <div class="card" id="srch-cur-card" style="display:none">
+        <div class="card-t">Training: <span id="srch-cur-act" style="color:var(--blue)">—</span></div>
+        <div class="prog-label"><span id="srch-cur-ep">—</span><span id="srch-cur-l2">rel L²: —</span></div>
+        <div class="prog-bg"><div class="prog-fill" id="srch-cur-fill" style="width:0%"></div></div>
+        <div style="text-align:right;font-size:10px;font-family:var(--mono);color:var(--txt3);margin-top:3px"><span id="srch-overall">0 / 0</span></div>
+      </div>
+    </div>
+    <div>
+      <div class="winner-card" id="srch-winner">
+        <div style="font-size:10px;color:var(--green);text-transform:uppercase;letter-spacing:.1em;margin-bottom:4px">Best Activation</div>
+        <h2 id="sw-name">—</h2>
+        <div style="font-family:var(--mono);font-size:12px;color:var(--txt2)" id="sw-stats">—</div>
+      </div>
+      <div class="card">
+        <div class="card-t">Leaderboard <span style="float:right;font-size:10px;font-weight:400;color:var(--txt3)" id="srch-prog-txt"></span></div>
+        <div class="lb-hdr"><span>#</span><span>Activation</span><span>Accuracy</span><span style="text-align:right">Rel L²</span><span style="text-align:right">Time</span></div>
+        <div id="lb-list"><div style="color:var(--txt3);font-size:12px;padding:10px 7px">Configure and click Run Search</div></div>
+      </div>
+      <div class="card"><div class="card-t">Log</div><div class="log h80" id="log-srch"></div></div>
+    </div>
+  </div>
+
+  <div class="card" id="overlay-card" style="display:none;margin-top:0">
+    <div class="card-t">Effect of Activation Functions — prediction overlay
+      <span style="float:right;font-size:10px;font-weight:400;color:var(--txt3)">dashed = analytic truth  ·  shading = training domain</span>
+    </div>
+    <div class="ch-wrap h320"><canvas id="ch-overlay"></canvas></div>
+  </div>
+</div>
+
+<!-- ═══════════════ AUTONOMOUS SWEEP TAB ══════════════════ -->
+<div class="tb" id="tb-sweep">
+  <div class="g2" style="align-items:start">
+    <div>
+      <div class="card">
+        <div class="card-t">Sweep configuration</div>
+        <p style="font-size:11px;color:var(--txt2);line-height:1.7;margin-bottom:10px">
+          <strong>Phase 1</strong> — rapid scan of all combos (short epochs, no L-BFGS).<br>
+          <strong>Phase 2</strong> — deep retrain of top-K with full epochs + L-BFGS.<br>
+          Streams a live leaderboard as each config finishes.
+        </p>
+        <div class="field">
+          <div class="field-l">Problem</div>
+          <div class="seg"><div class="seg-o on" id="sw-hrm" onclick="setSwPDE('harmonic')">Harmonic ODE</div><div class="seg-o" id="sw-mxw" onclick="setSwPDE('maxwell')">Maxwell EM</div></div>
+        </div>
+        <div class="g2" style="margin-bottom:8px">
+          <div class="field"><div class="field-l">Phase 1 epochs</div><input type="number" class="tag-inp" id="nb-ep1" value="400" min="100" max="2000" step="100"></div>
+          <div class="field"><div class="field-l">Phase 2 epochs</div><input type="number" class="tag-inp" id="nb-ep2" value="2000" min="500" max="10000" step="500"></div>
+          <div class="field"><div class="field-l">Retrain top-K</div><input type="number" class="tag-inp" id="nb-topk" value="3" min="1" max="10"></div>
+          <div class="field"><div class="field-l">Seed</div><input type="number" class="tag-inp" id="nb-seed" value="42" min="0" max="9999"></div>
+        </div>
+        <div class="field"><div class="field-l">Activations</div><div class="act-grid" id="sw-act-grid"></div>
+          <div class="btn-row" style="margin-top:3px">
+            <button class="btn btn-gray" style="font-size:10px;padding:2px 7px" onclick="selAll('sw-cb',true)">All</button>
+            <button class="btn btn-gray" style="font-size:10px;padding:2px 7px" onclick="selAll('sw-cb',false)">None</button>
+            <button class="btn btn-gray" style="font-size:10px;padding:2px 7px" onclick="selWave('sw-cb')">Wave</button>
+          </div>
+        </div>
+        <div class="field"><div class="field-l">Widths</div><input type="text" class="tag-inp" id="sw-widths" value="64,128" oninput="recalcCount()"></div>
+        <div class="field"><div class="field-l">Depths</div><input type="text" class="tag-inp" id="sw-depths" value="3,5" oninput="recalcCount()"></div>
+        <div class="field"><div class="field-l">Learning rates</div><input type="text" class="tag-inp" id="sw-lrs" value="0.001" oninput="recalcCount()"></div>
+        <div style="font-size:11px;color:var(--txt2);font-family:var(--mono);margin:7px 0">→ <span id="sw-count">0</span> total Phase-1 configs</div>
+        <div class="btn-row">
+          <button class="btn btn-amber" id="btn-sweep"      onclick="startSweep()">▶ Start Sweep</button>
+          <button class="btn btn-red"   id="btn-sweep-stop" onclick="stopAll()" style="display:none">■ Stop</button>
+        </div>
+      </div>
+    </div>
+    <div>
+      <div class="card">
+        <div class="card-t">Status</div>
+        <div style="font-size:13px;color:var(--txt);font-family:var(--mono);margin-bottom:7px" id="sw-phase-lbl">Configure and click Start Sweep</div>
+        <div class="prog-label"><span id="sw-cfg-lbl" style="font-size:10px;font-family:var(--mono);color:var(--txt3)">—</span><span id="sw-pct"></span></div>
+        <div class="prog-bg"><div class="prog-fill" id="sw-fill" style="width:0%"></div></div>
+      </div>
+      <div class="card">
+        <div class="card-t">Phase 1 — Rapid scan</div>
+        <div class="lb-hdr"><span>#</span><span>Config</span><span>Accuracy</span><span style="text-align:right">Rel L²</span><span style="text-align:right">Time</span></div>
+        <div id="sw-lb1" style="max-height:200px;overflow-y:auto"><div style="color:var(--txt3);font-size:12px;padding:8px 7px">—</div></div>
+      </div>
+      <div class="card">
+        <div class="card-t">Phase 2 — Deep training</div>
+        <div class="lb-hdr"><span>#</span><span>Config</span><span>Accuracy</span><span style="text-align:right">Rel L²</span><span style="text-align:right">Time</span></div>
+        <div id="sw-lb2" style="max-height:160px;overflow-y:auto"><div style="color:var(--txt3);font-size:12px;padding:8px 7px">—</div></div>
+      </div>
+      <div class="card"><div class="card-t">Sweep log</div><div class="log h120" id="log-sweep"></div></div>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════════ 3D EM FIELD TAB ════════════════════════ -->
+<div class="tb" id="tb-field3d">
+
+  <!-- Controls row -->
+  <div class="card" style="padding:10px 12px;margin-bottom:10px">
+    <div class="field-controls">
+      <div class="seg" style="width:340px;margin-bottom:0">
+        <div class="seg-o on" id="f3d-pred" onclick="set3DMode('pred')">PINN</div>
+        <div class="seg-o"    id="f3d-true" onclick="set3DMode('true')">Analytic</div>
+        <div class="seg-o"    id="f3d-both" onclick="set3DMode('both')">Overlay</div>
+        <div class="seg-o"    id="f3d-err"  onclick="set3DMode('err')">Error</div>
+        <div class="seg-o"    id="f3d-heat" onclick="set3DMode('heat')">Heatmap</div>
+      </div>
+      <div class="seg" style="width:180px;margin-bottom:0">
+        <div class="seg-o on" id="lay-single" onclick="set3DLayout('single')">Single</div>
+        <div class="seg-o"    id="lay-quad"   onclick="set3DLayout('quad')">Quad</div>
+        <div class="seg-o"    id="lay-side"   onclick="set3DLayout('side')">Side</div>
+      </div>
+      <button class="btn btn-gray" id="f3d-anim-btn" onclick="toggleAnim()" style="min-width:88px">▶ Animate</button>
+      <button class="btn btn-gray" onclick="render3D()">↺</button>
+      <button class="btn btn-gray" onclick="snapshot3D()" title="Save PNG + JSON snapshot">📷 Snap</button>
+      <span style="font-size:11px;color:var(--txt2);margin-left:auto">🖱 orbit · scroll zoom</span>
+    </div>
+    <div class="t-slider-row">
+      <span style="font-size:11px;color:var(--txt2);white-space:nowrap">Time t =</span>
+      <span id="tstar-val" style="font-family:var(--mono);font-size:12px;color:var(--cyan);width:44px;flex-shrink:0;text-align:right">0.25</span>
+      <input type="range" id="sl-tstar" min="0" max="6.28" step="0.04" value="0.25" oninput="onTStar(+this.value)">
+      <span style="font-size:10px;color:var(--txt3);white-space:nowrap">0 → 2π</span>
+      <span style="font-size:10px;color:var(--txt3);margin-left:8px" id="fps-disp"></span>
+    </div>
+  </div>
+
+  <!-- Snapshot gallery -->
+  <div id="snap-gallery" class="snap-gallery"></div>
+
+  <!-- Layout: Single -->
+  <div id="lay-wrap-single">
+    <div class="plot3d-wrap" id="plot3d" style="height:460px;margin-bottom:10px">
+      <div style="height:460px;display:flex;align-items:center;justify-content:center;color:var(--txt3);font-size:13px;flex-direction:column;gap:8px">
+        <div>📡 3D EM field visualization</div>
+        <div style="font-size:11px">Train a Maxwell EM model first</div>
+      </div>
+    </div>
+  </div>
+  <!-- Layout: Quad -->
+  <div id="lay-wrap-quad" style="display:none;margin-bottom:10px">
+    <div style="display:grid;grid-template-columns:1fr 1fr;grid-template-rows:1fr 1fr;gap:6px;height:480px">
+      <div class="plot3d-wrap" style="position:relative"><span style="position:absolute;top:6px;left:9px;font-size:9px;color:var(--txt3);z-index:1;font-family:var(--mono);text-transform:uppercase;letter-spacing:.08em">PINN</span><div id="q-pred" style="height:100%"></div></div>
+      <div class="plot3d-wrap" style="position:relative"><span style="position:absolute;top:6px;left:9px;font-size:9px;color:var(--txt3);z-index:1;font-family:var(--mono);text-transform:uppercase;letter-spacing:.08em">Analytic</span><div id="q-true" style="height:100%"></div></div>
+      <div class="plot3d-wrap" style="position:relative"><span style="position:absolute;top:6px;left:9px;font-size:9px;color:var(--red);z-index:1;font-family:var(--mono);text-transform:uppercase;letter-spacing:.08em">Error |PINN−true|</span><div id="q-err" style="height:100%"></div></div>
+      <div class="plot3d-wrap" style="position:relative"><span style="position:absolute;top:6px;left:9px;font-size:9px;color:var(--green);z-index:1;font-family:var(--mono);text-transform:uppercase;letter-spacing:.08em">Heatmap E(x,t)</span><div id="q-heat" style="height:100%"></div></div>
+    </div>
+  </div>
+  <!-- Layout: Side -->
+  <div id="lay-wrap-side" style="display:none;margin-bottom:10px">
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;height:400px">
+      <div class="plot3d-wrap"><div id="s-pred" style="height:100%"></div></div>
+      <div class="plot3d-wrap"><div id="s-true" style="height:100%"></div></div>
+    </div>
+  </div>
+
+  <!-- Slice charts + math -->
+  <div class="g3">
+    <div class="card">
+      <div class="card-t" style="color:#e05050">E(x) at t = <span id="e-t-label">0.25</span></div>
+      <div class="ch-wrap h160"><canvas id="ch-eslice"></canvas></div>
+    </div>
+    <div class="card">
+      <div class="card-t" style="color:#3b82f6">B(x) at t = <span id="b-t-label">0.25</span></div>
+      <div class="ch-wrap h160"><canvas id="ch-bslice"></canvas></div>
+    </div>
+    <div class="card">
+      <div class="card-t">Maxwell Equations</div>
+      <div class="math-box maxwell" style="font-size:11.5px;margin-bottom:8px">
+        ∂E/∂x + ∂B/∂t = 0<br>
+        ∂B/∂x + (1/c²)∂E/∂t = 0<br>
+        <span style="color:var(--txt3)">——————————————</span><br>
+        True solution (c=k=ω=1):<br>
+        E = B = sin(kx − ωt)
+      </div>
+      <div style="font-size:10px;color:var(--txt3);line-height:1.7">
+        <span style="color:#ef4444">━</span> E field oscillates in the <strong>Y plane</strong><br>
+        <span style="color:#3b82f6">━</span> B field oscillates in the <strong>Z plane</strong><br>
+        <span style="color:#888">━</span> X axis = propagation direction
+      </div>
+    </div>
+  </div>
+
+  <!-- Side-by-side comparison -->
+  <div class="g2" style="margin-top:0">
+    <div class="card">
+      <div class="card-t">PINN prediction</div>
+      <div id="plot3d-pred" style="height:280px"></div>
+    </div>
+    <div class="card">
+      <div class="card-t">Analytic truth</div>
+      <div id="plot3d-true" style="height:280px"></div>
+    </div>
+  </div>
+
+</div>
+
+<!-- ═══════════════ DATA TAB ═══════════════════════════════ -->
+<div class="tb" id="tb-data">
+  <div class="card">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:9px">
+      <div class="card-t" style="margin-bottom:0">All runs this session</div>
+      <div class="btn-row">
+        <button class="btn btn-gray" onclick="exportCSV()">⬇ Export CSV</button>
+        <button class="btn btn-gray" onclick="clearData()">Clear</button>
+      </div>
+    </div>
+    <div style="overflow-x:auto">
+      <table class="mtable" id="data-tbl">
+        <thead><tr>
+          <th>#</th><th>PDE</th><th>Activation</th><th>Width</th><th>Depth</th>
+          <th>LR</th><th>Epochs</th><th>Accuracy</th><th>Rel L²</th><th>PDE loss</th><th>Time</th>
+        </tr></thead>
+        <tbody id="data-body">
+          <tr><td colspan="11" style="text-align:center;color:var(--txt3);padding:20px">No runs yet</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+
+<!-- ═══════════════ PYTHON TERMINAL TAB ══════════════════ -->
+</div><!-- .content -->
+<div class="footer">
+  <span>PINN Research Platform · Maxwell EM + Harmonic ODE + Burgers + Heat · PyTorch float64</span>
+  <span id="footer-msg">Demo mode</span>
+</div>
+</div><!-- .shell -->
+
+<!-- ═══════════════════════════════════════════════════════════════
+     JAVASCRIPT
+═══════════════════════════════════════════════════════════════ -->
+<script>
+'use strict';
+
+/* ── State ──────────────────────────────────────────────────────── */
+const S = {
+  pde:'harmonic', searchPDE:'harmonic', sweepPDE:'harmonic',
+  live:false, backendOk:false, running:false,
+  ws:null, timer:null, lr:0.001,
+  runs:[], runId:0,
+  field3d:null,
+  compareCurves:{},
+  animFrame:null, animPlaying:false, animIdx:0,
+};
+
+const ALL_ACTS=['cos','sin','sincos','sin2x','tanh','swish','gelu','erf',
+  'morlet','sinc','damped_sin','mish','gaussian','isru','mex_hat','selu','elu'];
+const WAVE_ACTS=['cos','sin','sincos','sin2x','morlet','sinc','damped_sin'];
+const ACT_COLORS={
+  cos:'#06b6d4',sin:'#facc15',sincos:'#a78bfa',sin2x:'#34d399',
+  tanh:'#22c55e',swish:'#f472b6',gelu:'#fb923c',erf:'#ef4444',
+  morlet:'#f97316',sinc:'#3b82f6',damped_sin:'#8b5cf6',
+  mish:'#14b8a6',gaussian:'#84cc16',isru:'#ec4899',
+  mex_hat:'#fda4af',selu:'#94a3b8',elu:'#0ea5e9',
+};
+const PDE_MATH = {
+  harmonic: {cls:'harmonic', txt:'u″ + u = 0\nu(0) = 0  ·  u(π/2) = 1\nTrue: u = sin(x)\nTrain [0,2π]  ·  Eval [−20,20]'},
+  maxwell:  {cls:'maxwell',  txt:'∂E/∂x + ∂B/∂t = 0\n∂B/∂x + (1/c²)∂E/∂t = 0\nTrue: E=B=sin(kx−ωt)  c=k=ω=1\nLeft BC: driven  ·  Right BC: outflow'},
+  burgers:  {cls:'burgers',  txt:'u_t + u·u_x = ν·u_xx\nν = 0.01/π  (shock-forming)\nIC: u(x,0) = −sin(πx)\n−1 ≤ x ≤ 1,  0 ≤ t ≤ 1'},
+  heat:     {cls:'heat',     txt:'u_t = α·u_xx\nα = 0.1\nIC: u(x,0) = sin(x)\nBC: u(0,t) = u(2π,t) = 0'},
+};
+
+/* ── Controls ──────────────────────────────────────────────────── */
+function sync(k,v){
+  const lv=document.getElementById('lv-'+k);
+  const nb=document.getElementById('nb-'+k);
+  if(lv)lv.textContent=v;
+  if(nb)nb.value=v;
+  if(k==='depth'||k==='width')updateParamEst();
+}
+function syncNb(k,v){
+  const sl=document.getElementById('sl-'+k);
+  if(sl)sl.value=Math.min(+sl.max,Math.max(+sl.min,v));
+  sync(k,v);
+}
+function syncLR(lv){ S.lr=Math.pow(10,lv); const v=+S.lr.toPrecision(2); document.getElementById('nb-lr').value=v; document.getElementById('lv-lr').textContent=v.toExponential(0); }
+function syncLRnb(v){ if(!v||v<=0)return; S.lr=v; const lv=Math.log10(v); document.getElementById('sl-lr').value=Math.max(-5,Math.min(-1,lv)); document.getElementById('lv-lr').textContent=v.toExponential(0); }
+function togClick(k){ const e=document.getElementById('tgl-'+k); e.classList.toggle('on'); e.classList.toggle('off'); }
+function updateParamEst(){
+  const w=+document.getElementById('nb-width').value||128;
+  const d=+document.getElementById('nb-depth').value||5;
+  const est=w*w*(d-1)+2*w+w+1;
+  const e=document.getElementById('param-est');
+  if(e)e.textContent=`≈ ${est.toLocaleString()} parameters`;
+}
+function setPDE(p){
+  S.pde=p;
+  const map={harmonic:'hrm',maxwell:'mxw',burgers:'brg',heat:'ht'};
+  ['hrm','mxw','brg','ht'].forEach(k=>document.getElementById('seg-'+k)?.classList.toggle('on',map[p]===k));
+  const info=PDE_MATH[p]||PDE_MATH.harmonic;
+  const mb=document.getElementById('pde-mathbox');
+  mb.textContent=info.txt; mb.className='math-box '+info.cls;
+  document.getElementById('pill-pde').textContent=p.charAt(0).toUpperCase()+p.slice(1);
+  updateTopBar();
+}
+function setSPDE(p){S.searchPDE=p;['hrm','mxw'].forEach(k=>document.getElementById('ss-'+k).classList.toggle('on',k===(p==='harmonic'?'hrm':'mxw')))}
+function setSwPDE(p){S.sweepPDE=p;['hrm','mxw'].forEach(k=>document.getElementById('sw-'+k).classList.toggle('on',k===(p==='harmonic'?'hrm':'mxw')));recalcCount()}
+function onActChange(){
+  const v=document.getElementById('sel-act').value;
+  document.getElementById('act-builder').style.display=v==='__custom__'?'block':'none';
+  updateTopBar();
+}
+function setActMode(m){
+  S._actMode=m;
+  ['math','para'].forEach(k=>{
+    document.getElementById('act-tab-'+k).classList.toggle('on',k===m);
+    document.getElementById('act-mode-'+k).style.display=k===m?'':'none';
+  });
+  debounceActVal();
+}
+function updateTopBar(){
+  const act=getActDisplayLabel();
+  document.getElementById('top-sub').textContent=`${S.pde} · ${act} · ${S.live&&S.backendOk?'PyTorch':'Demo'}`;
+  updateTopBarPill();
+}
+function updateTopBarPill(){
+  const p=document.getElementById('pill-mode');
+  p.textContent=S.live&&S.backendOk?'LIVE':'DEMO';
+  p.className='pill '+(S.live&&S.backendOk?'pill-green':'pill-blue');
+}
+function toggleLive(){
+  const t=document.getElementById('tgl-live');
+  S.live=!t.classList.contains('on');
+  t.classList.toggle('on',S.live); t.classList.toggle('off',!S.live);
+  document.getElementById('backend-box').style.display=S.live?'':'none';
+  if(S.live)probeBackend(); else{S.backendOk=false;updateStatus();}
+}
+function probeBackend(){
+  const url=document.getElementById('ws-url').value.replace(/^ws/,'http').replace('/ws','');
+  const el=document.getElementById('backend-msg');
+  el.textContent='Checking…';el.style.color='var(--txt3)';
+  fetch(url+'/api/health',{signal:AbortSignal.timeout(2500)}).then(r=>r.json()).then(d=>{
+    S.backendOk=true;el.style.color='var(--green)';
+    el.textContent=`✓ ${d.device} · ${d.torch} · ${d.acts?.length||'?'} acts`;
+    tlog(`Backend ready: ${d.device} · ${d.torch}`,'ok','log-train');
+    updateStatus();
+  }).catch(()=>{
+    S.backendOk=false;el.style.color='var(--red)';
+    el.textContent='✗ Server not running (pip install then python run.py)';
+    updateStatus();
+  });
+}
+function updateStatus(){
+  const dot=document.getElementById('dot'),txt=document.getElementById('status-txt');
+  if(S.running){dot.className='dot run';txt.textContent='Running…';return}
+  if(S.live&&S.backendOk){dot.className='dot live';txt.textContent='PyTorch connected';}
+  else{dot.className='dot';txt.textContent=S.live?'Server offline':'Demo mode';}
+  updateTopBarPill();
+  document.getElementById('footer-msg').textContent=S.live&&S.backendOk?('Live: '+document.getElementById('ws-url').value):'Demo — no PyTorch needed';
+}
+function getActKey(){
+  const v=document.getElementById('sel-act').value;
+  return v==='__custom__'?'custom':v;
+}
+function getCustomExpr(){
+  if(document.getElementById('sel-act').value!=='__custom__')return '';
+  const mode=S._actMode||'math';
+  if(mode==='math') return document.getElementById('act-expr').value.trim();
+  if(mode==='para') return document.getElementById('act-para-template').value.trim();
+  return '';
+}
+function getActDisplayLabel(){
+  const v=document.getElementById('sel-act').value;
+  if(v!=='__custom__') return v;
+  const e=document.getElementById('act-expr')?.value.trim();
+  return e?e.slice(0,18)+'…':'custom';
+}
+function getCfg(ov={}){
+  return{pde:S.pde,suite:getActKey(),custom_act_expr:getCustomExpr(),
+    epochs:+document.getElementById('nb-ep').value,
+    width:+document.getElementById('nb-width').value,
+    depth:+document.getElementById('nb-depth').value,
+    lr:S.lr,n_colloc:+document.getElementById('nb-col').value,
+    use_lbfgs:document.getElementById('tgl-lbfgs').classList.contains('on'),...ov};
+}
+function getWS(){return document.getElementById('ws-url').value;}
+
+/* ── Chart helpers ─────────────────────────────────────────────── */
+const CBase={responsive:true,maintainAspectRatio:false,animation:{duration:0},
+  scales:{
+    x:{ticks:{color:'#4b5a73',font:{size:9},maxTicksLimit:5},grid:{color:'#1c2333'},border:{display:false}},
+    y:{ticks:{color:'#4b5a73',font:{size:9}},grid:{color:'#1c2333'},border:{display:false}},
+  },
+  plugins:{legend:{display:false},tooltip:{backgroundColor:'#1c2333',borderColor:'#252e42',borderWidth:1,
+    titleColor:'#94a3b8',bodyColor:'#e2e8f0',titleFont:{size:9,family:'monospace'},bodyFont:{size:10,family:'monospace'}}}
+};
+const charts={};
+function mkLine(id,yt,series){
+  const ctx=document.getElementById(id);if(!ctx)return null;
+  return new Chart(ctx,{type:'line',data:{labels:[],
+    datasets:series.map(([col,lbl])=>({label:lbl,data:[],borderColor:col,borderWidth:1.5,pointRadius:0,tension:.3,fill:false}))},
+    options:{...CBase,scales:{...CBase.scales,y:{...CBase.scales.y,type:yt}}}});
+}
+function initCharts(){
+  charts.total=mkLine('ch-total','logarithmic',[['var(--blue)','total'],['var(--cyan)','PDE']]);
+  charts.pde  =mkLine('ch-pde',  'logarithmic',[['var(--cyan)','PDE'],['var(--amber)','wave']]);
+  charts.acc  =mkLine('ch-acc',  'linear',     [['var(--green)','ratio']]);
+}
+function resetCharts(){
+  ['total','pde','acc'].forEach(k=>{const c=charts[k];if(!c)return;c.data.labels=[];c.data.datasets.forEach(d=>d.data=[]);c.update('none');});
+  ['ce-total','ce-pde','ce-acc'].forEach(id=>{const e=document.getElementById(id);if(e)e.style.display='';});
+}
+function updateCharts(h){
+  if(!h?.epoch?.length)return;
+  ['ce-total','ce-pde','ce-acc'].forEach(id=>{const e=document.getElementById(id);if(e)e.style.display='none';});
+  const upd=(c,...ds)=>{if(!c)return;c.data.labels=h.epoch;ds.forEach((d,i)=>c.data.datasets[i].data=d);c.update('none');};
+  upd(charts.total,h.loss||[],h.pde_loss||[]);
+  upd(charts.pde,h.pde_loss||[],h.wave_loss||[]);
+  upd(charts.acc,h.ratio||[]);
+}
+let chPred=null,chOverlay=null;
+function drawPredChart(vis,pde){
+  const c=document.getElementById('ch-pred');if(!c)return;
+  document.getElementById('ce-pred').style.display='none';
+  chPred?.destroy();chPred=null;
+  const ds=pde==='maxwell'?[
+    {label:'E true',data:vis.x.map((x,i)=>({x,y:vis.E_true[i]})),borderColor:'rgba(200,200,200,.4)',borderWidth:1.5,borderDash:[5,3],pointRadius:0,tension:.3},
+    {label:'E pred',data:vis.x.map((x,i)=>({x,y:vis.E_pred[i]})),borderColor:'#ef4444',borderWidth:2,pointRadius:0,tension:.3},
+    {label:'B true',data:vis.x.map((x,i)=>({x,y:vis.B_true[i]})),borderColor:'rgba(100,160,255,.4)',borderWidth:1.5,borderDash:[5,3],pointRadius:0,tension:.3},
+    {label:'B pred',data:vis.x.map((x,i)=>({x,y:vis.B_pred[i]})),borderColor:'#3b82f6',borderWidth:2,pointRadius:0,tension:.3},
+  ]:[
+    {label:'True',data:vis.x.map((x,i)=>({x,y:vis.true[i]})),borderColor:'rgba(255,255,255,.3)',borderWidth:1.5,borderDash:[6,3],pointRadius:0,tension:.3},
+    {label:'PINN',data:vis.x.map((x,i)=>({x,y:vis.pred[i]})),borderColor:'#ef4444',borderWidth:2,pointRadius:0,tension:.3},
+  ];
+  chPred=new Chart(c,{type:'line',data:{datasets:ds},options:{...CBase,parsing:{xAxisKey:'x',yAxisKey:'y'},
+    scales:{...CBase.scales,x:{...CBase.scales.x,type:'linear'}},
+    plugins:{...CBase.plugins,legend:{display:true,labels:{color:'#94a3b8',font:{size:9},boxWidth:9,padding:6}}}}});
+}
+function buildOverlay(cd){
+  if(!cd?.x?.length)return;
+  const c=document.getElementById('ch-overlay');if(!c)return;
+  document.getElementById('overlay-card').style.display='block';
+  chOverlay?.destroy();chOverlay=null;
+  const ds=[];
+  if(cd.true) ds.push({label:'True sin(x)',data:cd.x.map((v,i)=>({x:v,y:cd.true[i]})),
+    borderColor:'#ffffff',borderWidth:2.5,borderDash:[8,4],pointRadius:0,tension:.2});
+  Object.entries(cd.curves||{}).forEach(([act,vals])=>
+    ds.push({label:act,data:cd.x.map((v,i)=>({x:v,y:vals[i]})),
+      borderColor:ACT_COLORS[act]||'#888',borderWidth:1.5,pointRadius:0,tension:.2}));
+  chOverlay=new Chart(c,{type:'line',data:{datasets:ds},options:{...CBase,
+    parsing:{xAxisKey:'x',yAxisKey:'y'},
+    scales:{...CBase.scales,x:{...CBase.scales.x,type:'linear',title:{display:true,text:'x',color:'#94a3b8',font:{size:10}}},
+      y:{...CBase.scales.y,title:{display:true,text:'u(x)',color:'#94a3b8',font:{size:10}}}},
+    plugins:{...CBase.plugins,
+      title:{display:true,text:'PINN: Effect of Activation Functions',color:'#e2e8f0',font:{size:13,weight:'600'}},
+      legend:{display:true,labels:{color:'#94a3b8',font:{size:9},boxWidth:10,padding:6}}}}});
+}
+
+/* ════════════════════════════════════════════════════════════════
+   PLOTLY 3D EM FIELD — matches notebook geometry exactly
+   
+   Notebook matplotlib axes:
+     xlabel = "x (Propagation direction)"
+     ylabel = "Electric Field (E)"     ← E oscillates in Y
+     zlabel = "Magnetic Field (B)"     ← B oscillates in Z
+   
+   Plotly mapping: same axis labels, same camera angle (elev=20, azim=-60)
+   ════════════════════════════════════════════════════════════════ */
+
+let _3dMode='pred';
+let _animTimer=null;
+
+/* ── 3D base layouts ─────────────────────────────────────── */
+const PLbase={
+  paper_bgcolor:'#090d15',plot_bgcolor:'#090d15',
+  margin:{l:0,r:0,t:8,b:0},
+  font:{color:'#94a3b8',family:'JetBrains Mono,monospace',size:10},
+  legend:{font:{size:10},bgcolor:'rgba(0,0,0,0)',x:.01,y:.99},
+};
+const PLscene={
+  xaxis:{title:{text:'x  (Propagation)',font:{color:'#6b7280',size:9}},color:'#4b5a73',gridcolor:'#1a2233',
+         zerolinecolor:'#252e42',showspikes:false,tickfont:{color:'#4b5a73',size:8}},
+  yaxis:{title:{text:'E field',font:{color:'#ef4444',size:9}},color:'#4b5a73',gridcolor:'#1a2233',
+         zerolinecolor:'#252e42',showspikes:false,tickfont:{color:'#4b5a73',size:8}},
+  zaxis:{title:{text:'B field',font:{color:'#3b82f6',size:9}},color:'#4b5a73',gridcolor:'#1a2233',
+         zerolinecolor:'#252e42',showspikes:false,tickfont:{color:'#4b5a73',size:8}},
+  camera:{eye:{x:1.5,y:-1.2,z:0.7},up:{x:0,y:0,z:1}},
+  aspectratio:{x:2.5,y:1,z:1},bgcolor:'#090d15',
+};
+const PLOTLY_LAYOUT={...PLbase,scene:PLscene};
+const PLsmall={...PLbase,margin:{l:0,r:0,t:4,b:0},scene:PLscene};
+const PLOPT={responsive:true,displayModeBar:true,
+  modeBarButtonsToRemove:['sendDataToCloud','hoverClosest3d'],
+  toImageButtonOptions:{format:'png',width:1200,height:800,scale:2}};
+let _3dLayout='single'; // 'single'|'quad'|'side'
+
+/* ── helpers ──────────────────────────────────────────── */
+function _getFrame(data,ti){
+  const g=(arr)=>Array.isArray(arr?.[0])?arr[ti]||[]:arr||[];
+  return{Ep:g(data.E_pred),Bp:g(data.B_pred),Et:g(data.E_true),Bt:g(data.B_true)};
+}
+
+/* ══════════════════════════════════════════════════════════════════
+   PDE-SPECIFIC 3D TRACE BUILDERS
+   Each PDE gets its own geometrically correct 3D representation.
+══════════════════════════════════════════════════════════════════ */
+
+function makeTracesHarmonic(data, mode){
+  /* Harmonic ODE: u'' + u = 0
+     3D geometry: x (position) × u(x) (Y) × du/dx (Z)
+     This traces a circle in u-du/dx space — the exact phase portrait.
+     PINN vs analytic both shown; error = deviation from the circle. */
+  if(!data?.x?.length) return [];
+  const x=data.x, zeros=x.map(()=>0);
+  const up=data.u_pred||[], ut=data.u_true||[], dp=data.du_pred||[], dt=data.du_true||[];
+  const traces=[];
+
+  if(mode==='pred'||mode==='both'){
+    traces.push({type:'scatter3d',mode:'lines',name:'u (PINN)',
+      x,y:up,z:dp,line:{color:'#ef4444',width:3},opacity:mode==='both'?.9:1,showlegend:true});
+    // Ribbon to zero plane
+    traces.push({type:'surface',showscale:false,showlegend:false,
+      x:[x,x],y:[up,zeros],z:[dp,zeros],
+      colorscale:[[0,'#ef444420'],[1,'#ef4444']],opacity:.12,hoverinfo:'skip'});
+  }
+  if(mode==='true'||mode==='both'){
+    traces.push({type:'scatter3d',mode:'lines',name:'u (analytic)',
+      x,y:ut,z:dt,line:{color:mode==='both'?'#991111':'#34d399',width:mode==='both'?2:3},
+      opacity:mode==='both'?.5:1,showlegend:true});
+  }
+  if(mode==='err'){
+    const eU=up.map((v,i)=>Math.abs(v-(ut[i]??0)));
+    const eDu=dp.map((v,i)=>Math.abs(v-(dt[i]??0)));
+    const maxE=Math.max(...eU,1e-10);
+    traces.push({type:'scatter3d',mode:'lines',name:'|Δu|',
+      x,y:eU,z:eDu,line:{color:eU,colorscale:'Hot',cmin:0,cmax:maxE,width:3},showlegend:true});
+    traces.push({type:'surface',showscale:true,showlegend:false,
+      x:[x,x],y:[eU,zeros],z:[eDu,zeros],
+      colorscale:'Hot',cmin:0,cmax:maxE,opacity:.35,
+      colorbar:{title:'|Δu|',thickness:8,len:.7,tickfont:{color:'#94a3b8',size:8}},hoverinfo:'skip'});
+  }
+  // Phase portrait annotation
+  traces.push({type:'scatter3d',mode:'lines',name:'u²+(du/dx)²=1',
+    x,y:ut,z:dt,line:{color:'rgba(250,204,21,0.2)',width:1},showlegend:false});
+  return traces;
+}
+
+function makeTracesSpatiotemporal(data, mode, tIdx){
+  /* For Burgers and Heat: u(x,t) — spatiotemporal surface.
+     Main view: 3D surface of u_pred(x,t) and u_true(x,t).
+     Slice at current t shown as highlighted curve. */
+  if(!data?.x?.length||!data?.t?.length) return [];
+  const x=data.x, t=data.t;
+  const up=data.u_pred||[], ut=data.u_true||[];
+  const traces=[];
+  const PLpde=data.pde==='burgers'?'RdBu':'Plasma';
+
+  if(mode==='pred'||mode==='both'){
+    traces.push({type:'surface',name:'u (PINN)',
+      x,y:t,z:up,colorscale:PLpde,showscale:false,
+      opacity:mode==='both'?.85:0.92,showlegend:false,
+      contours:{z:{show:true,color:'rgba(255,255,255,.15)',width:1}}});
+    // Slice at current time
+    const slP=up[tIdx]||[];
+    const tVal=t[tIdx]??0;
+    traces.push({type:'scatter3d',mode:'lines',name:`PINN t=${tVal.toFixed(2)}`,
+      x,y:x.map(()=>tVal),z:slP,
+      line:{color:'#ef4444',width:4},showlegend:true});
+  }
+  if(mode==='true'||mode==='both'){
+    traces.push({type:'surface',name:'u (analytic)',
+      x,y:t,z:ut,colorscale:PLpde,showscale:mode==='true',
+      opacity:mode==='both'?.45:0.88,showlegend:false,
+      colorbar:{thickness:8,len:.8,tickfont:{color:'#94a3b8',size:8}}});
+    const slT=ut[tIdx]||[];
+    const tVal=t[tIdx]??0;
+    traces.push({type:'scatter3d',mode:'lines',name:`Analytic t=${tVal.toFixed(2)}`,
+      x,y:x.map(()=>tVal),z:slT,
+      line:{color:'#34d399',width:mode==='both'?2:4},showlegend:true});
+  }
+  if(mode==='err'){
+    const errGrid=up.map((row,ti)=>row.map((v,xi)=>Math.abs(v-(ut[ti]??[])[xi]??0)));
+    const maxE=Math.max(...errGrid.flat(),1e-10);
+    traces.push({type:'surface',name:'|error|',
+      x,y:t,z:errGrid,colorscale:'Hot',showscale:true,opacity:.88,showlegend:false,
+      colorbar:{title:'|error|',thickness:8,len:.8,tickfont:{color:'#94a3b8',size:8}}});
+    // Error slice
+    const slE=errGrid[tIdx]||[];
+    const tVal=t[tIdx]??0;
+    traces.push({type:'scatter3d',mode:'lines',name:`Error t=${tVal.toFixed(2)}`,
+      x,y:x.map(()=>tVal),z:slE,line:{color:'#f97316',width:4},showlegend:true});
+  }
+  return traces;
+}
+
+function getPDELayout(pde){
+  if(pde==='harmonic'){
+    return {...PLbase,scene:{...PLscene,
+      xaxis:{...PLscene.xaxis,title:{text:'x  (position)',font:{color:'#6b7280',size:9}}},
+      yaxis:{...PLscene.yaxis,title:{text:'u(x)',font:{color:'#ef4444',size:9}}},
+      zaxis:{...PLscene.zaxis,title:{text:'du/dx',font:{color:'#3b82f6',size:9}}},
+      aspectratio:{x:2.5,y:1,z:1}}};
+  }
+  if(pde==='burgers'||pde==='heat'){
+    return {...PLbase,scene:{
+      xaxis:{title:{text:'x',font:{color:'#6b7280',size:9}},color:'#4b5a73',gridcolor:'#1a2233',zerolinecolor:'#252e42',showspikes:false,tickfont:{color:'#4b5a73',size:8}},
+      yaxis:{title:{text:'t (time)',font:{color:'#6b7280',size:9}},color:'#4b5a73',gridcolor:'#1a2233',zerolinecolor:'#252e42',showspikes:false,tickfont:{color:'#4b5a73',size:8}},
+      zaxis:{title:{text:'u(x,t)',font:{color:'#22c55e',size:9}},color:'#4b5a73',gridcolor:'#1a2233',zerolinecolor:'#252e42',showspikes:false,tickfont:{color:'#4b5a73',size:8}},
+      camera:{eye:{x:1.6,y:-1.4,z:0.9},up:{x:0,y:0,z:1}},
+      aspectratio:{x:2,y:1.5,z:1},bgcolor:'#090d15',
+    }};
+  }
+  return PLOTLY_LAYOUT;
+}
+
+
+function make3DTraces(data, mode, tIdx){
+  if(!data?.x)return[];
+  const x=data.x, n=x.length;
+  const zeros=x.map(()=>0);
+  const {Ep,Bp,Et,Bt}=_getFrame(data,tIdx);
+  const traces=[];
+
+  function addField(E,B,Ecol,Bcol,sfx,op){
+    if(!E?.length||!B?.length)return;
+    // Field line with gradient coloring
+    traces.push({type:'scatter3d',mode:'lines',name:'E '+sfx,x,y:E,z:zeros,
+      line:{color:Ecol,width:3.5,colorscale:[[0,'#7f1d1d'],[0.5,Ecol],[1,'#fca5a5']]},
+      opacity:op,showlegend:true});
+    // Translucent filled ribbon — E in Y plane
+    traces.push({type:'surface',showscale:false,showlegend:false,
+      x:[x,x],y:[E,zeros],z:[zeros,zeros],
+      colorscale:[[0,Ecol+'20'],[0.5,Ecol+'60'],[1,Ecol]],opacity:op*.18,hoverinfo:'skip'});
+    // B field line
+    traces.push({type:'scatter3d',mode:'lines',name:'B '+sfx,x,y:zeros,z:B,
+      line:{color:Bcol,width:3.5},opacity:op,showlegend:true});
+    // Translucent filled ribbon — B in Z plane
+    traces.push({type:'surface',showscale:false,showlegend:false,
+      x:[x,x],y:[zeros,zeros],z:[B,zeros],
+      colorscale:[[0,Bcol+'20'],[0.5,Bcol+'60'],[1,Bcol]],opacity:op*.14,hoverinfo:'skip'});
+    // Amplitude envelope (magnitude)
+    const mag=E.map((e,i)=>Math.sqrt(e*e+(B[i]??0)*(B[i]??0)));
+    traces.push({type:'scatter3d',mode:'lines',name:'|EM| '+sfx,x,y:zeros,z:mag,
+      line:{color:'rgba(250,204,21,0.35)',width:1.5,dash:'dash'},opacity:op*.6,showlegend:false});
+  }
+
+  function addError(Ep,Et,Bp,Bt){
+    if(!Ep?.length||!Et?.length)return;
+    const eE=Ep.map((v,i)=>Math.abs(v-(Et[i]??0)));
+    const eB=Bp.map((v,i)=>Math.abs(v-(Bt[i]??0)));
+    const maxE=Math.max(...eE,1e-10);
+    // Error surface — color mapped by magnitude
+    traces.push({type:'scatter3d',mode:'lines',name:'ΔE error',x,y:eE,z:zeros,
+      line:{color:eE,colorscale:'Hot',cmin:0,cmax:maxE,width:3},showlegend:true});
+    traces.push({type:'surface',showscale:true,showlegend:false,
+      x:[x,x],y:[eE,zeros],z:[zeros,zeros],
+      colorscale:'Hot',cmin:0,cmax:maxE,opacity:.4,
+      colorbar:{title:'|ΔE|',thickness:8,len:.7,tickfont:{color:'#94a3b8',size:8}},hoverinfo:'skip'});
+    traces.push({type:'scatter3d',mode:'lines',name:'ΔB error',x,y:zeros,z:eB,
+      line:{color:'#22c55e',width:2},showlegend:true});
+  }
+
+  function addHeatmap(Ep,Et){
+    if(!Ep?.length)return;
+    // Represent E field as a filled surface in XY plane
+    // height = E value, color = E magnitude
+    const Eabs=Ep.map(v=>Math.abs(v));
+    traces.push({type:'scatter3d',mode:'lines+markers',name:'E surface',
+      x,y:Ep,z:zeros,
+      line:{color:Eabs,colorscale:'Plasma',width:4,cmin:0},
+      marker:{color:Eabs,colorscale:'Plasma',size:2,cmin:0},
+      showlegend:true});
+    if(Et?.length){
+      const diff=Ep.map((v,i)=>v-(Et[i]??0));
+      traces.push({type:'scatter3d',mode:'lines',name:'E error',x,y:diff,z:zeros,
+        line:{color:'#f97316',width:2,dash:'dot'},showlegend:true});
+    }
+  }
+
+  if(mode==='pred') addField(Ep,Bp,'#ef4444','#3b82f6','PINN',1);
+  if(mode==='true') addField(Et,Bt,'#dc2626','#1d4ed8','true',1);
+  if(mode==='both'){addField(Ep,Bp,'#ef4444','#3b82f6','PINN',.92);addField(Et,Bt,'#991111','#112266','true',.5);}
+  if(mode==='err')  addError(Ep,Et,Bp,Bt);
+  if(mode==='heat') addHeatmap(Ep,Et);
+
+  // Propagation axis
+  if(n>1) traces.push({type:'scatter3d',mode:'lines',name:'Propagation',
+    x:[x[0],x[n-1]],y:[0,0],z:[0,0],
+    line:{color:'rgba(255,255,255,.5)',width:5},showlegend:false});
+
+  // Add Poynting vector markers (every ~10th point)
+  if(mode==='pred'&&Ep?.length&&Bp?.length){
+    const step=Math.max(1,Math.floor(n/12));
+    const px=[],pe_y=[],pb_z=[];
+    for(let i=0;i<n;i+=step){px.push(x[i]);pe_y.push(Ep[i]);pb_z.push(Bp[i]);}
+    traces.push({type:'scatter3d',mode:'markers',name:'Sample points',
+      x:px,y:pe_y,z:zeros.slice(0,px.length),
+      marker:{color:'#fbbf24',size:3,symbol:'circle',opacity:.8},showlegend:false});
+  }
+  return traces;
+}
+
+function _makeTracesForPDE(data, mode, ti){
+  const pde=data.pde||'maxwell';
+  if(pde==='harmonic')  return makeTracesHarmonic(data, mode);
+  if(pde==='burgers'||pde==='heat') return makeTracesSpatiotemporal(data, mode, ti);
+  return make3DTraces(data, mode, ti); // maxwell default
+}
+
+function render3D(tIdx){
+  if(!S.field3d?.x?.length)return;
+  const ti=tIdx??getTIdx();
+  const pde=S.field3d.pde||'maxwell';
+  const layout=getPDELayout(pde);
+  const layoutSm={...layout,margin:{l:0,r:0,t:4,b:0}};
+  const tr=_makeTracesForPDE(S.field3d,_3dMode,ti);
+
+  // Update 3D tab label to reflect current PDE
+  const tabEl=document.querySelector('[data-t="field3d"]');
+  if(tabEl){
+    const labels={maxwell:'3D EM Field',harmonic:'3D Phase Portrait',burgers:'3D Burgers',heat:'3D Heat Field'};
+    tabEl.textContent=labels[pde]||'3D Field';
+  }
+
+  if(_3dLayout==='single'){
+    Plotly.react('plot3d',tr,layout,PLOPT)
+      .catch(()=>Plotly.newPlot('plot3d',tr,layout,PLOPT));
+  } else if(_3dLayout==='quad'){
+    const p=(id,m)=>{const t2=_makeTracesForPDE(S.field3d,m,ti);Plotly.react(id,t2,layoutSm,PLOPT).catch(()=>Plotly.newPlot(id,t2,layoutSm,PLOPT));};
+    p('q-pred','pred'); p('q-true','true'); p('q-err','err');
+    if(pde==='maxwell') renderHeatmap2D('q-heat',S.field3d,ti);
+    else {
+      // Heatmap slot: show E/u heatmap for non-Maxwell
+      renderSpatiotemporalHeatmap('q-heat',S.field3d,ti);
+    }
+  } else {
+    const p=(id,m)=>{const t2=_makeTracesForPDE(S.field3d,m,ti);Plotly.react(id,t2,layoutSm,PLOPT).catch(()=>Plotly.newPlot(id,t2,layoutSm,PLOPT));};
+    p('s-pred','pred'); p('s-true','true');
+  }
+  updateSliceCharts(ti);
+  updateSidePanels(ti);
+}
+
+function renderSpatiotemporalHeatmap(divId, data, ti){
+  if(!data?.u_pred||!data?.t) return;
+  const grid=Array.isArray(data.u_pred[0])?data.u_pred:null;
+  if(!grid) return;
+  const lay={paper_bgcolor:'#090d15',plot_bgcolor:'#090d15',margin:{l:35,r:10,t:6,b:30},
+    font:{color:'#94a3b8',size:9},
+    xaxis:{title:{text:'x',font:{color:'#4b5a73',size:9}},color:'#4b5a73',gridcolor:'#1a2233',tickfont:{color:'#4b5a73',size:8}},
+    yaxis:{title:{text:'t',font:{color:'#4b5a73',size:9}},color:'#4b5a73',gridcolor:'#1a2233',tickfont:{color:'#4b5a73',size:8}},
+    coloraxis:{colorscale:data.pde==='heat'?'Plasma':'RdBu',cmin:-1,cmax:1,colorbar:{thickness:7,len:.85,tickfont:{color:'#94a3b8',size:8}}}};
+  Plotly.react(divId,[{type:'heatmap',z:grid,x:data.x,y:data.t,coloraxis:'coloraxis'}],lay,{responsive:true,displayModeBar:false})
+    .catch(()=>Plotly.newPlot(divId,[{type:'heatmap',z:grid,x:data.x,y:data.t,coloraxis:'coloraxis'}],lay,{responsive:true,displayModeBar:false}));
+}
+
+function renderHeatmap2D(divId,data,ti){
+  if(!data?.E_pred||!data?.t)return;
+  // Build E(x,t) heatmap from full grid
+  const Egrid=Array.isArray(data.E_pred[0])?data.E_pred:null;
+  if(!Egrid)return;
+  const lay={paper_bgcolor:'#090d15',plot_bgcolor:'#090d15',margin:{l:35,r:10,t:6,b:30},
+    font:{color:'#94a3b8',size:9},
+    xaxis:{title:{text:'x',font:{color:'#4b5a73',size:9}},color:'#4b5a73',gridcolor:'#1a2233',tickfont:{color:'#4b5a73',size:8}},
+    yaxis:{title:{text:'t',font:{color:'#4b5a73',size:9}},color:'#4b5a73',gridcolor:'#1a2233',tickfont:{color:'#4b5a73',size:8}},
+    coloraxis:{colorscale:'RdBu',cmin:-1,cmax:1,colorbar:{thickness:7,len:.85,tickfont:{color:'#94a3b8',size:8}}}};
+  Plotly.react(divId,[{type:'heatmap',z:Egrid,x:data.x,y:data.t,coloraxis:'coloraxis'}],lay,{responsive:true,displayModeBar:false})
+    .catch(()=>Plotly.newPlot(divId,[{type:'heatmap',z:Egrid,x:data.x,y:data.t,coloraxis:'coloraxis'}],lay,{responsive:true,displayModeBar:false}));
+}
+
+function set3DLayout(l){
+  _3dLayout=l;
+  ['single','quad','side'].forEach(k=>{
+    document.getElementById('lay-'+k)?.classList.toggle('on',k===l);
+    document.getElementById('lay-wrap-'+k).style.display=k===l?'':'none';
+  });
+  render3D();
+}
+
+function getTIdx(){
+  const tStar = +document.getElementById('sl-tstar').value;
+  if(!S.field3d?.t?.length)return 0;
+  const ts = S.field3d.t;
+  let best=0, bDist=Infinity;
+  ts.forEach((t,i)=>{const d=Math.abs(t-tStar);if(d<bDist){bDist=d;best=i;}});
+  return best;
+}
+
+function set3DMode(m){
+  _3dMode=m;
+  ['pred','true','both','err','heat'].forEach(k=>document.getElementById('f3d-'+k)?.classList.toggle('on',k===m));
+  render3D();
+}
+
+function onTStar(v){
+  document.getElementById('tstar-val').textContent=v.toFixed(2);
+  document.getElementById('e-t-label').textContent=v.toFixed(2);
+  document.getElementById('b-t-label').textContent=v.toFixed(2);
+  render3D();
+}
+
+function updateSliceCharts(ti){
+  if(!S.field3d)return;
+  const fg=S.field3d;
+  const pde=fg.pde||'maxwell';
+  const x=fg.x;
+  function slice(id,pred,truth,pc,tc,ylabel,ylabel2){
+    const c=document.getElementById(id);if(!c)return;
+    Chart.getChart(c)?.destroy();
+    new Chart(c,{type:'line',data:{datasets:[
+      {label:'PINN',data:x.map((v,i)=>({x:v,y:(pred[i]??null)})),borderColor:pc,borderWidth:1.8,pointRadius:0,tension:.3},
+      {label:'True',data:x.map((v,i)=>({x:v,y:(truth[i]??null)})),borderColor:tc,borderWidth:1.2,borderDash:[5,3],pointRadius:0,tension:.3},
+    ]},options:{...CBase,parsing:{xAxisKey:'x',yAxisKey:'y'},
+      scales:{...CBase.scales,x:{...CBase.scales.x,type:'linear',
+        title:{display:!!ylabel,text:ylabel||'x',color:'#94a3b8',font:{size:9}}},
+        y:{...CBase.scales.y,title:{display:!!ylabel2,text:ylabel2||'',color:'#94a3b8',font:{size:9}}}},
+      plugins:{...CBase.plugins,legend:{display:true,labels:{color:'#94a3b8',font:{size:9},boxWidth:8}}}}});
+  }
+  const get=(arr,ti)=>Array.isArray(arr?.[0])?arr[ti]||[]:arr||[];
+  if(pde==='maxwell'){
+    slice('ch-eslice',get(fg.E_pred,ti),get(fg.E_true,ti),'#ef4444','#555','x','E(x)');
+    slice('ch-bslice',get(fg.B_pred,ti),get(fg.B_true,ti),'#3b82f6','#335','x','B(x)');
+  } else if(pde==='harmonic'){
+    slice('ch-eslice',fg.u_pred,fg.u_true,'#ef4444','#555','x','u(x)');
+    slice('ch-bslice',fg.du_pred,fg.du_true,'#3b82f6','#335','x','du/dx');
+    // Update slice labels
+    const el=document.getElementById('e-t-label');
+    const bl=document.getElementById('b-t-label');
+    if(el)el.parentElement.childNodes[0].textContent='u(x) — PINN vs analytic';
+    if(bl)bl.parentElement.childNodes[0].textContent='du/dx — PINN vs analytic';
+  } else {
+    // burgers / heat — slice at time ti
+    slice('ch-eslice',get(fg.u_pred,ti),get(fg.u_true,ti),'#ef4444','#555','x','u(x,t)');
+    // Error slice
+    const predRow=get(fg.u_pred,ti), trueRow=get(fg.u_true,ti);
+    const err=predRow.map((v,i)=>Math.abs(v-(trueRow[i]??0)));
+    slice('ch-bslice',err,err.map(()=>0),'#f97316','#333','x','|error|');
+    // Update t-labels
+    const tVal=(fg.t??[])[ti]??0;
+    const el=document.getElementById('e-t-label'); if(el)el.textContent=tVal.toFixed(3);
+    const bl=document.getElementById('b-t-label'); if(bl)bl.textContent=tVal.toFixed(3);
+  }
+}
+
+function updateSidePanels(ti){
+  if(!S.field3d?.x?.length||!S.field3d?.E_pred)return;
+  const makeSmall=(el,data,mode)=>{
+    if(!el)return;
+    const traces=make3DTraces(data,mode,ti);
+    const lay={...PLOTLY_LAYOUT,margin:{l:0,r:0,t:4,b:0},height:280,
+      scene:{...PLOTLY_LAYOUT.scene,camera:{eye:{x:1.5,y:-1.2,z:.7}}}};
+    Plotly.react(el,traces,lay,{responsive:true,displayModeBar:false})
+      .catch(()=>Plotly.newPlot(el,traces,lay,{responsive:true,displayModeBar:false}));
+  };
+  makeSmall('plot3d-pred',S.field3d,'pred');
+  makeSmall('plot3d-true',S.field3d,'true');
+}
+
+function toggleAnim(){
+  S.animPlaying=!S.animPlaying;
+  const btn=document.getElementById('f3d-anim-btn');
+  btn.textContent=S.animPlaying?'■ Stop':'▶ Animate';
+  if(S.animPlaying) animStep(); else {clearTimeout(_animTimer);document.getElementById('fps-disp').textContent='';}
+}
+let _animLast=0,_animFPS=0,_animFc=0;
+function animStep(){
+  if(!S.animPlaying||!S.field3d)return;
+  const now=performance.now();
+  if(now-_animLast>1000){_animFPS=_animFc;_animFc=0;_animLast=now;document.getElementById('fps-disp').textContent=_animFPS+'fps';}
+  _animFc++;
+  const nt=S.field3d.nt||S.field3d.t?.length||80;
+  S.animIdx=(S.animIdx+1)%nt;
+  const t=S.field3d.t?.[S.animIdx]||0;
+  document.getElementById('sl-tstar').value=t;
+  document.getElementById('tstar-val').textContent=t.toFixed(2);
+  document.getElementById('e-t-label').textContent=t.toFixed(2);
+  document.getElementById('b-t-label').textContent=t.toFixed(2);
+  render3D(S.animIdx);
+  _animTimer=setTimeout(animStep,60);
+}
+
+/* ── Leaderboard render ─────────────────────────────────────────── */
+function renderLB(lb, id){
+  const el=document.getElementById(id);
+  if(!lb?.length){el.innerHTML='<div style="color:var(--txt3);font-size:12px;padding:8px 7px">—</div>';return;}
+  const best=lb[0].rel_l2||1;
+  el.innerHTML=lb.slice(0,20).map((r,i)=>{
+    const pct=Math.max(4,Math.round((1-r.rel_l2/best)*100));
+    const cls=i===0?'r1':i===1?'r2':i===2?'r3':'';
+    const name=r.cfg_id||r.act||'?';
+    const col=i===0?'var(--green)':i===1?'var(--blue)':'var(--txt3)';
+    return `<div class="lb-row ${cls}" onclick="onLBClick(${JSON.stringify(r).replace(/"/g,'&quot;')})">
+      <span class="lb-rank">${r.rank||i+1}</span>
+      <span style="color:var(--txt);overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${name}">${name}</span>
+      <div><div class="lb-bar-bg"><div class="lb-bar" style="width:${pct}%;background:${col}"></div></div></div>
+      <span style="text-align:right;color:${col}">${r.ratio!=null?(r.ratio*100).toFixed(1)+'%':'—'}</span>
+      <span style="text-align:right;color:var(--txt3)">${r.rel_l2!=null?r.rel_l2.toFixed(4):'—'}</span>
+    </div>`;
+  }).join('');
+}
+function onLBClick(r){
+  // If the entry has vis_data or field_grid, load it
+  if(r.field_grid||r.field_3d){
+    S.field3d=r.field_grid||r.field_3d;
+    goTab('field3d'); setTimeout(render3D,100);
+  }
+  if(r.vis_data) drawPredChart(r.vis_data, r.pde||S.sweepPDE);
+}
+
+/* ── Log ───────────────────────────────────────────────────────── */
+function tlog(msg,type='info',el='log-train'){
+  const div=document.getElementById(el);if(!div)return;
+  const t=new Date().toLocaleTimeString('en',{hour12:false});
+  const d=document.createElement('div');
+  d.className='log-'+(type==='ok'?'ok':type==='err'?'err':type==='dim'?'dim':'info');
+  d.innerHTML=`<span style="color:var(--txt3)">[${t}]</span> ${msg}`;
+  div.appendChild(d);div.scrollTop=div.scrollHeight;
+}
+
+/* ── Progress / Done ──────────────────────────────────────────── */
+function onProg(p){
+  const ep=p.epoch,tot=p.n_epochs,ratio=p.ratio||0;
+  document.getElementById('k-ep').textContent=`${ep}/${tot}`;
+  document.getElementById('k-acc').textContent=`${(ratio*100).toFixed(1)}%`;
+  document.getElementById('k-acc').className='kpi-v'+(ratio>.9?' good':ratio>.7?' warn':' bad');
+  document.getElementById('k-l2').textContent=(p.rel_l2||0).toFixed(4);
+  document.getElementById('k-pde').textContent=(p.pde_loss||0).toExponential(2);
+  document.getElementById('k-t').textContent=`${p.elapsed}s`;
+  const pg=Math.round(ep/tot*100);
+  document.getElementById('prog-fill').style.width=`${pg}%`;
+  document.getElementById('prog-pct').textContent=`${pg}%`;
+  document.getElementById('prog-lbl').textContent=`Epoch ${ep}/${tot}${p.history?.wave_loss?.slice(-1)[0]>1e-6?' [wave active]':''}`;
+  document.getElementById('loss-detail').textContent=
+    `pde ${(p.pde_loss||0).toExponential(2)}  ·  wave ${(p.wave_loss||0).toExponential(2)}  ·  BC ${(p.left_loss||0).toExponential(2)}`;
+  // Loss table (notebook-style every ~10% of training)
+  if(Math.round(ep/tot*10)!==Math.round((ep-1)/tot*10)){
+    const tbl=document.getElementById('loss-table');
+    const d=document.createElement('div');d.style.cssText='font-family:var(--mono);font-size:10px;color:var(--txt2)';
+    d.textContent=`ep${String(ep).padStart(5)} | tot ${(p.loss||0).toExponential(2)} | pde ${(p.pde_loss||0).toExponential(2)} | wave ${(p.wave_loss||0).toExponential(2)} | left ${(p.left_loss||0).toExponential(2)}`;
+    tbl.appendChild(d);tbl.scrollTop=tbl.scrollHeight;
+  }
+  if(p.history) updateCharts(p.history);
+}
+function onDone(r,cfg){
+  S.running=false;stopUI();
+  document.getElementById('k-ep').textContent='Done';
+  if(r.vis_data) drawPredChart(r.vis_data,cfg.pde||S.pde);
+  if(r.field_grid||r.field_3d){
+    S.field3d=r.field_grid||r.field_3d;
+    document.querySelector('[data-t="field3d"]').style.color='var(--amber)';
+    setTimeout(render3D,100);
+  }
+  document.getElementById('pred-info').textContent=`${cfg.suite||'?'} · rel L²=${r.rel_l2.toFixed(4)} · ${(r.n_params||0).toLocaleString()} params`;
+  tlog(`✓ ratio=${r.ratio.toFixed(4)} rel_l2=${r.rel_l2.toFixed(5)} t=${r.elapsed}s`,'ok');
+  S.runId++; const row={id:S.runId,pde:cfg.pde||S.pde,act:cfg.suite||'?',width:cfg.width,depth:cfg.depth,lr:cfg.lr,epochs:cfg.epochs,ratio:r.ratio,rel_l2:r.rel_l2,pde_loss:r.history?.pde_loss?.slice(-1)[0]||0,elapsed:r.elapsed,_field3d:r.field_grid||r.field_3d||null,_vis:r.vis_data||null};
+  S.runs.push(row);addDataRow(row);
+  updateStatus();
+}
+
+/* ── Single run ────────────────────────────────────────────────── */
+function startSingle(){
+  if(S.running)return;
+  S.running=true;updateStatus();
+  document.getElementById('btn-run').style.display='none';
+  document.getElementById('btn-stop').style.display='';
+  document.getElementById('loss-table').innerHTML='';
+  resetCharts();goTab('train');
+  const cfg=getCfg({mode:'single'});
+  tlog(`${cfg.pde} · ${cfg.suite} · w${cfg.width}d${cfg.depth} · lr${S.lr.toExponential(0)} · ${cfg.epochs}ep`,'info');
+  if(S.live&&S.backendOk){
+    const ws=new WebSocket(getWS());S.ws=ws;
+    ws.onopen=()=>{tlog('WS open','dim');ws.send(JSON.stringify(cfg))};
+    ws.onmessage=e=>{const m=JSON.parse(e.data);
+      if(m.type==='status')  tlog(m.msg,'dim');
+      if(m.type==='progress')onProg(m);
+      if(m.type==='error')   {tlog(m.msg,'err');stopAll();}
+      if(m.type==='done')    {onDone(m,cfg);S.ws=null;}
+    };
+    ws.onerror=()=>{tlog('WS error','err');stopAll()};
+    ws.onclose=()=>{S.ws=null};
+  } else {
+    tlog('Demo mode','dim');
+    simRun(cfg,onProg,r=>onDone(r,cfg),cfg.suite);
+  }
+}
+
+/* ── Activation Search ─────────────────────────────────────────── */
+function buildActGrid(containerId,cls){
+  const el=document.getElementById(containerId);if(!el)return;
+  el.innerHTML=ALL_ACTS.map(a=>`<label class="cb-l"><input type="checkbox" class="${cls}" value="${a}" ${WAVE_ACTS.includes(a)?'checked':''}> ${a}</label>`).join('');
+}
+function selAll(cls,on){document.querySelectorAll('.'+cls).forEach(c=>c.checked=on)}
+function selWave(cls){document.querySelectorAll('.'+cls).forEach(c=>c.checked=WAVE_ACTS.includes(c.value))}
+function getActs(cls){return[...document.querySelectorAll('.'+cls+':checked')].map(c=>c.value)}
+
+function startSearch(){
+  const acts=getActs('sa-cb');if(!acts.length){tlog('No acts selected','err','log-srch');return}
+  S.running=true;updateStatus();
+  document.getElementById('btn-srch').style.display='none';document.getElementById('btn-srch-stop').style.display='';
+  document.getElementById('srch-cur-card').style.display='block';document.getElementById('srch-winner').style.display='none';
+  document.getElementById('overlay-card').style.display='none';
+  const cfg={mode:'search',pde:S.searchPDE,activations:acts,
+    epochs:+document.getElementById('nb-sep').value,
+    width:+document.getElementById('nb-sw').value||128,
+    depth:+document.getElementById('nb-sd').value||5,lr:S.lr,n_colloc:2048,seed:42};
+  tlog(`Search: ${acts.length} acts · ${cfg.pde} · ${cfg.epochs}ep each`,'info','log-srch');
+  const cdAcc={x:null,true:null,curves:{}};
+  const handleMsg=m=>{
+    if(m.type==='status')         tlog(m.msg,'dim','log-srch');
+    if(m.type==='search_start')   {document.getElementById('srch-cur-act').textContent=m.act;document.getElementById('srch-cur-fill').style.width='0%';document.getElementById('srch-overall').textContent=`${m.index+1}/${m.total}`;}
+    if(m.type==='search_progress'){const pg=Math.round(m.epoch/m.n_epochs*100);document.getElementById('srch-cur-fill').style.width=pg+'%';document.getElementById('srch-cur-ep').textContent=`ep ${m.epoch}/${m.n_epochs}`;document.getElementById('srch-cur-l2').textContent=`rel L²: ${(m.rel_l2||0).toFixed(4)}`;}
+    if(m.type==='search_result')  {renderLB(m.leaderboard,'lb-list');document.getElementById('srch-prog-txt').textContent=`${m.index+1}/${m.total}`;tlog(`${m.act}: ${(m.result.ratio*100).toFixed(1)}% rl2=${m.result.rel_l2.toFixed(4)} t=${m.result.elapsed}s`,'ok','log-srch');if(m.compare_data)buildOverlay(m.compare_data);if(m.field_grid)S.field3d=m.field_grid;saveRun({pde:cfg.pde,act:m.act,width:cfg.width,depth:cfg.depth,lr:cfg.lr,epochs:cfg.epochs,...m.result},m.field_grid||m.field_3d,m.vis_data);}
+    if(m.type==='search_done')    {S.running=false;stopUI();document.getElementById('btn-srch').style.display='';document.getElementById('btn-srch-stop').style.display='none';document.getElementById('srch-cur-card').style.display='none';updateStatus();const w=m.leaderboard?.[0];if(w){document.getElementById('srch-winner').style.display='block';document.getElementById('sw-name').textContent=w.act;document.getElementById('sw-stats').textContent=`Accuracy ${(w.ratio*100).toFixed(2)}%  ·  Rel L² ${w.rel_l2.toFixed(5)}  ·  ${w.elapsed}s`;tlog(`✓ Winner: ${w.act}  rel_l2=${w.rel_l2.toFixed(5)}`,'ok','log-srch');}if(m.compare_data)buildOverlay(m.compare_data);}
+    if(m.type==='error')          {tlog(m.msg,'err','log-srch');stopAll();}
+  };
+  if(S.live&&S.backendOk){
+    const ws=new WebSocket(getWS());S.ws=ws;
+    ws.onopen=()=>ws.send(JSON.stringify(cfg));
+    ws.onmessage=e=>handleMsg(JSON.parse(e.data));
+    ws.onerror=()=>{tlog('WS error','err','log-srch');stopAll()};
+    ws.onclose=()=>{S.ws=null};
+  } else {
+    tlog('Demo mode','dim','log-srch');
+    let idx=0;
+    function next(){
+      if(!S.running||idx>=acts.length){handleMsg({type:'search_done',leaderboard:[],compare_data:cdAcc,pde:cfg.pde});return}
+      const act=acts[idx];
+      handleMsg({type:'search_start',act,index:idx,total:acts.length});
+      simRun({...cfg,pde:S.searchPDE},
+        p=>handleMsg({type:'search_progress',act,...p}),
+        r=>{if(!cdAcc.x&&r.compare?.x){cdAcc.x=r.compare.x;cdAcc.true=r.compare.true;}if(r.compare?.pred)cdAcc.curves[act]=r.compare.pred;
+        const lb=[...Array(idx+1)].map((_,i)=>({act:acts[i],ratio:.7+i*.03,rel_l2:.3-i*.03,elapsed:8,rank:i+1}));lb[idx]={act,ratio:r.ratio,rel_l2:r.rel_l2,elapsed:r.elapsed,rank:1};lb.sort((a,b)=>a.rel_l2-b.rel_l2);lb.forEach((x,i)=>x.rank=i+1);
+        handleMsg({type:'search_result',act,index:idx,total:acts.length,result:{act,ratio:r.ratio,rel_l2:r.rel_l2,elapsed:r.elapsed},leaderboard:lb,compare_data:{...cdAcc},field_grid:r.field_grid,vis_data:r.vis_data});idx++;setTimeout(next,100);},act);
+    }
+    next();
+  }
+}
+
+/* ── Autonomous Sweep ──────────────────────────────────────────── */
+function parseCsv(s){return s.split(',').map(v=>+v.trim()).filter(n=>!isNaN(n)&&n>0)}
+function recalcCount(){const a=getActs('sw-cb'),w=parseCsv(document.getElementById('sw-widths').value),d=parseCsv(document.getElementById('sw-depths').value),l=parseCsv(document.getElementById('sw-lrs').value);document.getElementById('sw-count').textContent=a.length*w.length*d.length*l.length}
+
+function startSweep(){
+  const acts=getActs('sw-cb');if(!acts.length){tlog('No acts','err','log-sweep');return}
+  const widths=parseCsv(document.getElementById('sw-widths').value);
+  const depths=parseCsv(document.getElementById('sw-depths').value);
+  const lrs=parseCsv(document.getElementById('sw-lrs').value);
+  S.running=true;updateStatus();
+  document.getElementById('btn-sweep').style.display='none';document.getElementById('btn-sweep-stop').style.display='';
+  document.getElementById('sw-lb1').innerHTML='<div style="color:var(--txt3);font-size:12px;padding:8px">Running Phase 1…</div>';
+  document.getElementById('sw-lb2').innerHTML='<div style="color:var(--txt3);font-size:12px;padding:8px">Awaiting Phase 2…</div>';
+  const cfg={mode:'sweep',pde:S.sweepPDE,activations:acts,widths,depths,lrs,
+    phase1_epochs:+document.getElementById('nb-ep1').value,
+    phase2_epochs:+document.getElementById('nb-ep2').value,
+    top_k:+document.getElementById('nb-topk').value,n_colloc:2048,
+    seed:+document.getElementById('nb-seed').value};
+  tlog(`Sweep: ${acts.length}×${widths.length}×${depths.length}×${lrs.length} configs | ${cfg.pde}`,'info','log-sweep');
+  const handleMsg=m=>{
+    if(m.type==='status')         tlog(m.msg,'dim','log-sweep');
+    if(m.type==='phase')          {document.getElementById('sw-phase-lbl').textContent=`Phase ${m.phase}: ${m.label}`;document.getElementById('sw-fill').style.width='0%';tlog(m.label,'info','log-sweep');}
+    if(m.type==='sweep_plan')     tlog(`${m.total} configs planned  |  Phase1: ${m.phase1_epochs}ep  Phase2: ${m.phase2_epochs}ep`,'info','log-sweep');
+    if(m.type==='sweep_start')    {document.getElementById('sw-cfg-lbl').textContent=`[${m.index+1}/${m.total}] ${m.cfg_id}`;document.getElementById('sw-fill').style.width=`${Math.round(m.index/m.total*100)}%`;document.getElementById('sw-pct').textContent=`${Math.round(m.index/m.total*100)}%`;}
+    if(m.type==='sweep_result')   {if(m.phase===2){renderLB(m.leaderboard_p2||[],'sw-lb2');if(m.vis_data)drawPredChart(m.vis_data,cfg.pde);if(m.field_grid){S.field3d=m.field_grid;setTimeout(render3D,100);};}else{renderLB(m.leaderboard||[],'sw-lb1');}if(m.compare_data)buildOverlay(m.compare_data);tlog(`${m.result.cfg_id}: ${(m.result.ratio*100).toFixed(1)}% rl2=${m.result.rel_l2.toFixed(4)}`,'ok','log-sweep');saveRun({pde:cfg.pde,act:m.result.act||m.result.cfg_id,width:m.result.width||128,depth:m.result.depth||5,lr:m.result.lr||0.001,epochs:m.phase===1?cfg.phase1_epochs:cfg.phase2_epochs,ratio:m.result.ratio,rel_l2:m.result.rel_l2,pde_loss:0,elapsed:m.result.elapsed},m.field_grid||m.field_3d,m.vis_data);}
+    if(m.type==='phase_done')     tlog(`Phase 1 done — winner: ${m.winner_p1}`,'ok','log-sweep');
+    if(m.type==='sweep_done')     {S.running=false;stopUI();updateStatus();document.getElementById('btn-sweep').style.display='';document.getElementById('btn-sweep-stop').style.display='none';document.getElementById('sw-fill').style.width='100%';const w=m.winner;if(w){document.getElementById('sw-phase-lbl').textContent=`Done — winner: ${w.cfg_id||w.act}`;tlog(`✓ Winner: ${w.cfg_id||w.act}  rel_l2=${w.rel_l2?.toFixed(5)}`,'ok','log-sweep');}if(m.field_3d){S.field3d=m.field_3d;setTimeout(render3D,100);}if(m.compare_data)buildOverlay(m.compare_data);renderLB(m.leaderboard_p2||[],'sw-lb2');}
+    if(m.type==='error')          {tlog(m.msg,'err','log-sweep');stopAll();}
+  };
+  if(S.live&&S.backendOk){
+    const ws=new WebSocket(getWS());S.ws=ws;
+    ws.onopen=()=>ws.send(JSON.stringify(cfg));
+    ws.onmessage=e=>handleMsg(JSON.parse(e.data));
+    ws.onerror=()=>{tlog('WS error','err','log-sweep');stopAll()};
+    ws.onclose=()=>{S.ws=null};
+  } else {
+    tlog('Demo sweep','dim','log-sweep');
+    // Build config list
+    const configs=[];for(const a of acts)for(const w of widths)for(const d of depths)for(const l of lrs)configs.push({act:a,width:w,depth:d,lr:l,cfg_id:`${a}|w${w}d${d}|lr${l.toExponential(0)}`});
+    handleMsg({type:'sweep_plan',total:configs.length,...cfg});
+    handleMsg({type:'phase',phase:1,label:`Rapid scan — ${configs.length} configs × ${cfg.phase1_epochs}ep`});
+    const lb1=[];const cdAcc={x:null,true:null,curves:{}};let idx=0;
+    function nextP1(){
+      if(!S.running||idx>=configs.length){handleMsg({type:'phase_done',phase:1,winner_p1:lb1[0]?.cfg_id||'—',leaderboard_p1:lb1});idx=0;handleMsg({type:'phase',phase:2,label:`Deep retrain top ${cfg.top_k} × ${cfg.phase2_epochs}ep`});setTimeout(nextP2,300);return;}
+      const c=configs[idx];handleMsg({type:'sweep_start',index:idx,total:configs.length,cfg_id:c.cfg_id,phase:1});
+      simRun({...cfg,pde:S.sweepPDE,epochs:cfg.phase1_epochs},()=>{},r=>{
+        if(!cdAcc.x&&r.compare?.x){cdAcc.x=r.compare.x;cdAcc.true=r.compare.true;}if(r.compare?.pred)cdAcc.curves[c.act]=r.compare.pred;
+        const res={...c,ratio:r.ratio,pct:r.pct,rel_l2:r.rel_l2,elapsed:r.elapsed,phase:1};lb1.push(res);lb1.sort((a,b)=>a.rel_l2-b.rel_l2);lb1.forEach((x,i)=>x.rank=i+1);
+        handleMsg({type:'sweep_result',result:res,phase:1,leaderboard:lb1,compare_data:{...cdAcc}});idx++;setTimeout(nextP1,80);},c.act);
+    }
+    const lb2=[];
+    function nextP2(){
+      const top=lb1.slice(0,cfg.top_k);if(!S.running||idx>=top.length){handleMsg({type:'sweep_done',leaderboard_p1:lb1,leaderboard_p2:lb2,winner:lb2[0]||lb1[0],compare_data:cdAcc});return;}
+      const c=top[idx];handleMsg({type:'sweep_start',index:idx,total:top.length,cfg_id:c.cfg_id,phase:2});
+      simRun({...cfg,pde:S.sweepPDE,epochs:cfg.phase2_epochs},()=>{},r=>{
+        const res={...c,ratio:r.ratio,rel_l2:r.rel_l2,elapsed:r.elapsed,phase:2,vis_data:r.vis_data,field_grid:r.field_3d||r.field_grid};lb2.push(res);lb2.sort((a,b)=>a.rel_l2-b.rel_l2);lb2.forEach((x,i)=>x.rank=i+1);
+        handleMsg({type:'sweep_result',result:res,phase:2,leaderboard_p2:lb2,compare_data:{...cdAcc},vis_data:r.vis_data,field_grid:r.field_3d||r.field_grid});idx++;setTimeout(nextP2,100);},c.act);
+    }
+    nextP1();
+  }
+}
+
+/* ── Data table ────────────────────────────────────────────────── */
+function saveRun(r,fg,vis){S.runId++;const row={id:S.runId,...r,_field3d:fg||null,_vis:vis||null};S.runs.push(row);addDataRow(row);}
+function addDataRow(r){
+  const tb=document.getElementById('data-body');
+  if(tb.querySelector('[colspan]'))tb.innerHTML='';
+  const tr=document.createElement('tr');
+  const has3D=!!(r._field3d);
+  const pdeCol=r.rel_l2<.1?'#4ade80':r.rel_l2<.3?'#fbbf24':'#f87171';
+  tr.style.cursor=has3D?'pointer':'';
+  tr.title=has3D?'Double-click to view 3D field visualization':'';
+  if(has3D) tr.style.borderLeft='2px solid var(--cyan)';
+  tr.innerHTML=[
+    r.id,
+    `<span style="color:var(--cyan)">${r.pde}</span>`,
+    r.act,r.width||'?',r.depth||'?',
+    (r.lr||0.001).toExponential(1),r.epochs,
+    `<span style="color:${pdeCol};font-weight:600">${(r.ratio*100).toFixed(2)}%</span>`,
+    `<span style="color:${pdeCol}">${r.rel_l2.toFixed(5)}</span>`,
+    (r.pde_loss||0).toExponential(2),(r.elapsed||0)+'s',
+    has3D?`<span style="color:var(--cyan);font-size:10px" title="Double-click to view 3D">📡</span>`:'—'
+  ].map(v=>`<td style="padding:5px 8px">${v}</td>`).join('');
+  if(has3D){
+    tr.addEventListener('dblclick',()=>{
+      S.field3d=r._field3d;
+      if(r._vis) drawPredChart(r._vis,r.pde);
+      goTab('field3d');
+      setTimeout(()=>render3D(0),120);
+      tlog(`Loaded 3D view: run #${r.id} · ${r.pde} · ${r.act}`,'ok');
+    });
+  }
+  tb.appendChild(tr);
+}
+
+// Update data table header to include 3D column
+function initDataTable(){
+  const tbl=document.getElementById('data-tbl');
+  if(!tbl)return;
+  const hdrs=['#','PDE','Activation','Width','Depth','LR','Epochs','Accuracy','Rel L²','PDE Loss','Time','3D'];
+  tbl.querySelector('thead tr').innerHTML=hdrs.map(h=>`<th style="padding:4px 8px">${h}</th>`).join('');
+}
+function exportCSV(){
+  if(!S.runs.length)return;
+  const h='id,pde,activation,width,depth,lr,epochs,accuracy,rel_l2,pde_loss,time_s';
+  const csv=[h,...S.runs.map(r=>[r.id,r.pde,r.act,r.width,r.depth,r.lr,r.epochs,r.ratio,r.rel_l2,r.pde_loss||0,r.elapsed].join(','))].join('\n');
+  const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([csv],{type:'text/csv'}));a.download=`pinn_${new Date().toISOString().slice(0,10)}.csv`;a.click();
+}
+function clearData(){S.runs=[];S.runId=0;document.getElementById('data-body').innerHTML='<tr><td colspan="11" style="text-align:center;color:var(--txt3);padding:20px">No runs yet</td></tr>';}
+
+/* ── Stop ──────────────────────────────────────────────────────── */
+function stopAll(){
+  if(S.ws){S.ws.close();S.ws=null}
+  if(S.timer){clearTimeout(S.timer);S.timer=null}
+  if(_animTimer){clearTimeout(_animTimer);_animTimer=null;S.animPlaying=false;}
+  S.running=false;stopUI();updateStatus();
+  ['btn-run','btn-srch','btn-sweep'].forEach(id=>{const e=document.getElementById(id);if(e)e.style.display=''});
+  ['btn-stop','btn-srch-stop','btn-sweep-stop'].forEach(id=>{const e=document.getElementById(id);if(e)e.style.display='none'});
+  document.getElementById('srch-cur-card').style.display='none';
+  tlog('Stopped','err');
+}
+function stopUI(){
+  document.getElementById('btn-run').style.display='';
+  document.getElementById('btn-stop').style.display='none';
+}
+
+/* ── Tabs ──────────────────────────────────────────────────────── */
+const TABS=['train','search','sweep','field3d','data'];
+function goTab(t){
+  TABS.forEach(id=>{document.getElementById('tb-'+id).classList.toggle('on',id===t);document.querySelector(`[data-t="${id}"]`).classList.toggle('on',id===t);});
+}
+
+/* ══════════════════════════════════════════════════════════════════
+   SIMULATION — demo mode (no PyTorch needed)
+   Generates realistic training curves + vis data that match
+   what the actual backend produces.
+══════════════════════════════════════════════════════════════════ */
+function simRun(cfg, onProg, onDone, act){
+  const {epochs,pde}=cfg;
+  let ep=0;
+  const step=Math.max(1,Math.floor(epochs/100));
+  const isWave=WAVE_ACTS.includes(act||'cos');
+  const peak=isWave?(0.88+Math.random()*.09):(0.70+Math.random()*.12);
+  const h={epoch:[],loss:[],pde_loss:[],wave_loss:[],ratio:[]};
+
+  const tick=()=>{
+    ep=Math.min(ep+step,epochs);
+    const t=ep/epochs;
+    const loss=2.2*Math.exp(-5.8*t)+0.003+.002*(Math.random()-.5);
+    const pde_=loss*.55,wave_=t>.3?loss*.07:0,left_=loss*.18;
+    const ratio=Math.min(peak,.08+peak*.9*(1-Math.exp(-7*t))+.006*Math.random());
+    h.epoch.push(ep);h.loss.push(+loss.toFixed(5));h.pde_loss.push(+pde_.toFixed(5));
+    h.wave_loss.push(+wave_.toFixed(5));h.ratio.push(+ratio.toFixed(4));
+    onProg({epoch:ep,n_epochs:epochs,loss,pde_loss:pde_,wave_loss:wave_,left_loss:left_,
+      ratio,pct:ratio*96,rel_l2:+(1-ratio).toFixed(4),elapsed:+(t*8).toFixed(1),history:{...h},act:act||'cos'});
+    if(ep<epochs){S.timer=setTimeout(tick,25);return;}
+
+    // Build realistic vis + field_grid data
+    const NX=120,NT=80,pi=Math.PI;
+    const xs=Array.from({length:NX},(_,i)=>+(i*2*pi/(NX-1)).toFixed(4));
+    const ts=Array.from({length:NT},(_,i)=>+(i*2*pi/(NT-1)).toFixed(4));
+    let vis={},fg=null,cmp={};
+
+    if(pde==='maxwell'){
+      const k=1,om=1;
+      const t0=0.25;
+      const Et=xs.map(x=>Math.sin(k*x-om*t0)),Bt=xs.map(x=>Math.sin(k*x-om*t0));
+      const Ep=Et.map(v=>v*(peak+.01*(Math.random()-.5)));
+      const Bp=Bt.map(v=>v*(peak+.01*(Math.random()-.5)));
+      vis={x:xs,E_true:Et,E_pred:Ep,B_true:Bt,B_pred:Bp};
+      cmp={x:xs,pred:Ep,true:Et};
+      const E_pred_grid=[],B_pred_grid=[],E_true_grid=[],B_true_grid=[];
+      for(const t of ts){
+        const eT=xs.map(x=>Math.sin(k*x-om*t));
+        const eP=eT.map(v=>v*(peak+.005*(Math.random()-.5)));
+        E_pred_grid.push(eP);B_pred_grid.push(eP.map(v=>v));
+        E_true_grid.push(eT);B_true_grid.push(eT.map(v=>v));
+      }
+      fg={pde:'maxwell',nx:NX,nt:NT,x:xs,t:ts,E_pred:E_pred_grid,B_pred:B_pred_grid,E_true:E_true_grid,B_true:B_true_grid};
+
+    } else if(pde==='harmonic'){
+      // Harmonic ODE: u'' + u = 0, u=sin(x), domain [-20,20]
+      // 3D: x vs u_pred vs du/dx  (traces out a circle — natural geometry)
+      const NHX=300;
+      const xH=Array.from({length:NHX},(_,i)=>+(-20+i*40/(NHX-1)).toFixed(4));
+      const uT=xH.map(x=>Math.sin(x));
+      const duT=xH.map(x=>Math.cos(x));  // analytic derivative
+      const uP=uT.map(v=>v*(peak+.008*(Math.random()-.5)));
+      const duP=duT.map(v=>v*(peak+.008*(Math.random()-.5)));
+      vis={x:xH,pred:uP,true:uT};
+      cmp={x:xH,pred:uP,true:uT};
+      fg={pde:'harmonic',x:xH,u_pred:uP,u_true:uT,du_pred:duP,du_true:duT};
+
+    } else if(pde==='burgers'){
+      // Burgers: u_t + u*u_x = nu*u_xx, nu=0.01/pi
+      // Domain: x in [-1,1], t in [0,1]
+      const NB=80,pi=Math.PI,nu=0.01/pi;
+      const xB=Array.from({length:NB},(_,i)=>+(-1+i*2/(NB-1)).toFixed(4));
+      const tB=Array.from({length:NB},(_,i)=>+(i/(NB-1)).toFixed(4));
+      // Approximate Burgers solution: tanh-based shock approximation
+      const uT_grid=[],uP_grid=[];
+      for(const tv of tB){
+        const row=xB.map(xv=>{
+          // Composite shock approximation
+          const xi=xv+0.5*tv;
+          return -Math.tanh(xi/(2*nu+tv*.5+.02));
+        });
+        uT_grid.push(row);
+        uP_grid.push(row.map(v=>v*(peak+.01*(Math.random()-.5))));
+      }
+      const snapshot=uT_grid[Math.round(NB*.3)];
+      const snapP=uP_grid[Math.round(NB*.3)];
+      vis={x:xB,pred:snapP,true:snapshot};
+      cmp={x:xB,pred:snapP,true:snapshot};
+      fg={pde:'burgers',nx:NB,nt:NB,x:xB,t:tB,u_pred:uP_grid,u_true:uT_grid};
+
+    } else if(pde==='heat'){
+      // Heat: u_t = alpha*u_xx, alpha=0.1
+      // Domain: x in [0,2pi], t in [0,2pi]  
+      const NH=80,pi=Math.PI,alpha=0.1;
+      const xHt=Array.from({length:NH},(_,i)=>+(i*2*pi/(NH-1)).toFixed(4));
+      const tHt=Array.from({length:NH},(_,i)=>+(i*2*pi/(NH-1)).toFixed(4));
+      const uT_g=[],uP_g=[];
+      for(const tv of tHt){
+        const row=xHt.map(xv=>Math.exp(-alpha*tv)*Math.sin(xv));
+        uT_g.push(row);
+        uP_g.push(row.map(v=>v*(peak+.008*(Math.random()-.5))));
+      }
+      const snap=uT_g[Math.round(NH*.2)];
+      const snapP=uP_g[Math.round(NH*.2)];
+      vis={x:xHt,pred:snapP,true:snap};
+      cmp={x:xHt,pred:snapP,true:snap};
+      fg={pde:'heat',nx:NH,nt:NH,x:xHt,t:tHt,u_pred:uP_g,u_true:uT_g};
+    }
+
+    onDone({ratio:peak,pct:peak*96,rel_l2:+(1-peak).toFixed(4),elapsed:+(t*8).toFixed(1),
+      n_params:132482,vis_data:vis,field_grid:fg,field_3d:fg,compare:cmp,history:h});
+  };
+  S.timer=setTimeout(tick,50);
+}
+
+/* ── Init ──────────────────────────────────────────────────────── */
+document.addEventListener('DOMContentLoaded',()=>{
+  initCharts();
+  buildActGrid('search-act-grid','sa-cb');
+  buildActGrid('sw-act-grid','sw-cb');
+  document.getElementById('sw-act-grid').addEventListener('change',recalcCount);
+  ['sw-widths','sw-depths','sw-lrs'].forEach(id=>document.getElementById(id).addEventListener('input',recalcCount));
+  recalcCount();
+  updateStatus();
+  setPDE('harmonic');
+  S._actMode='math';
+  initDataTable();
+  tlog('Ready. Select problem + activation, then click ▶ Run','info','log-train');
+  tlog('Toggle "Live PyTorch" to connect your backend server','dim','log-train');
+});
+</script>
+</body>
+</html>
